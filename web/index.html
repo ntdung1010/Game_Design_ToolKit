@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GD Toolkit</title>
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/app.css">
+<link rel="stylesheet" href="assets/kit.css">
+<meta name="gdk-token" content="__GDK_TOKEN__">
+<meta name="referrer" content="no-referrer">
+<script src="assets/theme.js"></script>
+</head>
+<body>
+<div class="frame-lines" aria-hidden="true"><i class="l"></i><i class="m"></i><i class="r"></i></div>
+<header class="nav">
+  <div class="nav-in">
+    <a class="brand" href="#/">
+      <img src="assets/logo.svg" alt="" width="30" height="30">
+      <span>GD Toolkit</span>
+    </a>
+    <nav class="nav-links">
+      <a href="#/" data-nav="home">Tools <span class="count" id="navCount"></span></a>
+      <a href="#/settings" data-nav="settings">Cài đặt</a>
+      <a href="#/admin" data-nav="admin" id="navAdmin" hidden>Quản lý</a>
+    </nav>
+    <div class="nav-right">
+      <button class="kbd-search" id="openPalette" title="Tìm tool (Ctrl K)">
+        <span data-icon="search"></span><span class="lbl">Tìm tool…</span><kbd>Ctrl K</kbd>
+      </button>
+      <button class="icon-btn" id="themeBtn" title="Đổi giao diện sáng / tối"><span data-icon="sun"></span></button>
+      <a class="u-chip" id="uChip" href="#/settings"><span class="av"></span><span class="nm"></span></a>
+      <button class="icon-btn" id="logoutBtn" title="Đăng xuất"><span data-icon="logout"></span></button>
+    </div>
+  </div>
+</header>
+
+<main id="view"><div class="boot"><div class="boot-in"><img src="assets/logo.svg" alt="" width="58" height="58"><div class="load-msg" style="margin:0">Đang mở GD Toolkit<span class="load-dots"><i></i><i></i><i></i></span></div></div></div></main>
+
+<footer class="foot">
+  <div class="foot-in">
+    <span class="mono">GD Toolkit <span id="ver"></span></span>
+    <span class="dim">Máy chủ nội bộ của team · tài khoản &amp; nhật ký trong <span class="mono">data/</span> · kết quả chạy trong <span class="mono">out/</span></span>
+  </div>
+</footer>
+
+<div class="palette" id="palette" hidden>
+  <div class="palette-box" role="dialog" aria-label="Tìm tool">
+    <div class="palette-in"><span data-icon="search"></span><input id="paletteInput" placeholder="Gõ tên tool hoặc trang…" autocomplete="off"></div>
+    <div class="palette-list" id="paletteList"></div>
+    <div class="palette-foot mono"><span>↑↓ chọn</span><span>Enter mở</span><span>Esc đóng</span></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<div class="signature" aria-label="Chữ ký">Design by <b>Dũng NT</b></div>
+
+<script src="assets/app.js"></script>
+<script src="assets/fx.js"></script>
+<script src="assets/mascot.js"></script>
+<script src="assets/illus.js"></script>
+<script src="lib/table.js"></script>
+<script src="lib/secure.js"></script>
+<script src="assets/kit.js"></script>
+</body>
+</html>

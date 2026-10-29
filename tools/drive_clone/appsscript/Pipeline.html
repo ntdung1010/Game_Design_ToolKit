@@ -1,0 +1,958 @@
+<script>
+/* Drive Clone — LÕI nghiệp vụ (chạy trên trình duyệt, trong web app Apps Script).
+   scan → plan → clone → đổi link → mục lục → hậu kiểm → Change Log. Port 1-1 từ bản Python cũ
+   (tools/drive_clone/pipeline.py + changelog.py) — cùng thuật toán, cùng tên hàm (camelCase).
+
+   Lõi chỉ nói chuyện với 1 "backend" bất đồng bộ:
+     GasBackend  (App.html)  → google.script.run → Code.gs → Google Drive / Sheets API bằng tài khoản của CHÍNH người dùng
+     FakeDrive   (dưới đây)  → Drive giả lập trong bộ nhớ: chế độ Demo + test tự động (tests/js/driveclone_gas.test.js)
+   Đường dẫn trong cây lưu dạng MẢNG các phần (parts), vì tên thư mục Drive được phép chứa "/". */
+var DC = (function () {
+  "use strict";
+  var FOLDER_MIME = "application/vnd.google-apps.folder";
+  var SHORTCUT_MIME = "application/vnd.google-apps.shortcut";
+  var SHEET_MIME = "application/vnd.google-apps.spreadsheet";
+  var DOC_MIME = "application/vnd.google-apps.document";
+  var SLIDE_MIME = "application/vnd.google-apps.presentation";
+  var DRAW_MIME = "application/vnd.google-apps.drawing";
+  var FORM_MIME = "application/vnd.google-apps.form";
+  var XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  var GOOGLE_PREFIX = "application/vnd.google-apps.";
+  var NATIVE_CREATABLE = [DOC_MIME, SHEET_MIME, SLIDE_MIME, DRAW_MIME];
+  var PROP_SRC = "gdk_src";
+  var MY_DRIVE = "root";
+  var PATH_SEP = "  /  ", LOG_SEP = " / ", LOG_PREFIX = "Change Log – ", INDEX_TITLE = "_INDEX_AUTO";
+  var DEFAULT_MASTER_PATTERN = "master|tong\\s*hop|tổng\\s*hợp|index|summary|muc\\s*luc|mục\\s*lục";
+  var ID_IN_URL = /(?:\/folders\/|\/d\/|[?&]id=)([A-Za-z0-9_-]{10,})/g;
+  var noop = function () {};
+
+  function nowIso() {
+    var d = new Date(), z = function (n) { return (n < 10 ? "0" : "") + n; };
+    return d.getFullYear() + "-" + z(d.getMonth() + 1) + "-" + z(d.getDate()) + "T" + z(d.getHours()) + ":" + z(d.getMinutes()) + ":" + z(d.getSeconds());
+  }
+  function showPath(parts) { return parts && parts.length ? parts.join(PATH_SEP) : "(gốc)"; }
+  function parseId(text) {
+    text = String(text || "").trim();
+    if (!text) return "";
+    var m = /(?:\/folders\/|\/d\/|[?&]id=)([A-Za-z0-9_-]{10,})/.exec(text);
+    if (m) return m[1];
+    return text.split("?")[0].replace(/^\/+|\/+$/g, "");
+  }
+  function viewUrl(id, mime) {
+    if (mime === FOLDER_MIME) return "https://drive.google.com/drive/folders/" + id;
+    if (mime === SHEET_MIME) return "https://docs.google.com/spreadsheets/d/" + id + "/edit";
+    if (mime === DOC_MIME) return "https://docs.google.com/document/d/" + id + "/edit";
+    if (mime === SLIDE_MIME) return "https://docs.google.com/presentation/d/" + id + "/edit";
+    return "https://drive.google.com/file/d/" + id + "/view";
+  }
+  function isGoogle(mime) { return String(mime).indexOf(GOOGLE_PREFIX) === 0; }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function key(parts) { return JSON.stringify(parts); }
+
+  /** Chạy fn trên từng phần tử, tối đa n việc cùng lúc, kết quả giữ đúng thứ tự đầu vào. */
+  function mapLimit(items, n, fn) {
+    var out = new Array(items.length), next = 0;
+    function lane() {
+      if (next >= items.length) return Promise.resolve();
+      var i = next++;
+      return Promise.resolve().then(function () { return fn(items[i], i); }).then(function (v) { out[i] = v; return lane(); });
+    }
+    var lanes = [];
+    for (var k = 0; k < Math.max(1, Math.min(n || 1, items.length)); k++) lanes.push(lane());
+    return Promise.all(lanes).then(function () { return out; });
+  }
+
+  // ======================================================================== 1. QUÉT
+  /** Quét cây theo từng tầng; các thư mục cùng tầng liệt kê song song (workers luồng). */
+  async function scan(backend, rootId, o) {
+    o = o || {};
+    var log = o.log || noop, shouldStop = o.shouldStop || function () { return false; };
+    var root;
+    try { root = await backend.getFile(rootId); } catch (e) { throw new Error("Không đọc được thư mục A — " + (e.message || e)); }
+    if (root.mimeType !== FOLDER_MIME) throw new Error("ID này không phải thư mục: " + (root.name || rootId));
+    var items = [], seen = {}, nextLog = 200, frontier = [{ parts: [], id: rootId }], depth = 0, maxDepth = o.maxDepth || 30;
+    seen[rootId] = 1;
+    log("Quét thư mục: " + (root.name || "?"));
+    while (frontier.length && depth <= maxDepth) {
+      var lists = await mapLimit(frontier, Math.max(1, Math.min(o.workers || 4, 8)), function (entry) {
+        if (shouldStop()) throw new Error("Đã dừng quét.");
+        return backend.listChildren(entry.id);
+      });
+      var nxt = [];
+      frontier.forEach(function (entry, fi) {
+        lists[fi].forEach(function (child) {
+          var cparts = entry.parts.concat([child.name]);
+          var mime = child.mimeType;
+          var item = {
+            id: child.id, name: child.name, mime: mime, parts: cparts, path: showPath(cparts), parent_parts: entry.parts.slice(),
+            depth: depth + 1, kind: mime === FOLDER_MIME ? "folder" : "file",
+            bytes: parseInt(child.size || child.quotaBytesUsed || 0, 10) || 0,
+            url: child.webViewLink || viewUrl(child.id, mime), props: child.appProperties || {},
+          };
+          if (mime === SHORTCUT_MIME) { item.kind = "shortcut"; item.target_id = (child.shortcutDetails || {}).targetId || ""; }
+          items.push(item);
+          if (mime === FOLDER_MIME && !seen[child.id]) { seen[child.id] = 1; nxt.push({ parts: cparts, id: child.id }); }
+        });
+      });
+      if (items.length >= nextLog) { log("  … đã thấy " + items.length + " mục"); nextLog = items.length + 200; }
+      frontier = nxt; depth++;
+    }
+    var folders = items.filter(function (i) { return i.kind === "folder"; }).length;
+    log("Quét xong: " + folders + " thư mục, " + (items.length - folders) + " file");
+    return {
+      root: { id: rootId, name: root.name || "", url: viewUrl(rootId, FOLDER_MIME) }, scanned_at: nowIso(), items: items,
+      stats: { folders: folders, files: items.length - folders, total: items.length,
+        depth: items.reduce(function (m, i) { return Math.max(m, i.depth); }, 0),
+        bytes: items.reduce(function (s, i) { return s + (i.kind === "file" ? i.bytes : 0); }, 0) },
+    };
+  }
+
+  // ======================================================================== 2. ĐỔI TÊN
+  /** Giữ kiểu chữ của đoạn bị thay: BSHP → PRSP, bshp → prsp, Bshp → Prsp. */
+  function matchCase(sample, text) {
+    if (sample === sample.toUpperCase()) return text.toUpperCase();
+    if (sample === sample.toLowerCase()) return text.toLowerCase();
+    if (sample.charAt(0) === sample.charAt(0).toUpperCase() && sample.slice(1) === sample.slice(1).toLowerCase())
+      return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
+    return text;
+  }
+  var escRe = function (s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); };
+  /** "\1" kiểu Python → "$1" kiểu JS; "$" người dùng gõ giữ nguyên là chữ. */
+  var pyRepl = function (s) { return String(s).replace(/\$/g, "$$$$").replace(/\\(\d+)/g, "$$$1"); };
+  function applyRule(name, rule) {
+    var src = rule.from || "";
+    if (!src) return name;
+    var dst = rule.to || "", ic = !!rule.ignore_case;
+    if (rule.regex) {
+      try { return name.replace(new RegExp(src, ic ? "gi" : "g"), pyRepl(dst)); } catch (e) { return name; }
+    }
+    if (!ic) return name.split(src).join(dst);
+    return name.replace(new RegExp(escRe(src), "gi"), function (m) { return m === src ? dst : matchCase(m, dst); });
+  }
+  function rename(name, rules) { (rules || []).forEach(function (r) { name = applyRule(name, r); }); return name; }
+  function ruleProblems(rules) {
+    var out = [];
+    (rules || []).forEach(function (r, i) {
+      if (r.regex && r.from) { try { new RegExp(r.from); } catch (e) { out.push("Quy tắc " + (i + 1) + " — regex sai: " + e.message); } }
+    });
+    return out;
+  }
+
+  // ======================================================================== 3. KẾ HOẠCH
+  var DEFAULT_OPTIONS = {
+    dest_parent: "", content_mode: "full", wrap_root: false, new_root_name: "", rename_rules: [], item_modes: {},
+    auto_master: true, master_pattern: DEFAULT_MASTER_PATTERN, binary_mode: "skeleton", uncreatable_mode: "placeholder_doc",
+    shortcut_mode: "retarget", remap_links: "masters", build_index: false, skip_existing: true, write_log_sheet: true,
+    dry_run: false, workers: 4,
+  };
+  function normalizeOptions(opts) {
+    var o = Object.assign({}, DEFAULT_OPTIONS, opts || {});
+    if (o.remap_links === true) o.remap_links = "masters";
+    else if (o.remap_links === false || o.remap_links == null || o.remap_links === "") o.remap_links = "off";
+    o.rename_rules = (o.rename_rules || []).filter(function (r) { return r && r.from; });
+    o.item_modes = Object.assign({}, o.item_modes || {});
+    return o;
+  }
+  /** Sheet / xlsx khớp tên mẫu hoặc nằm ngay ở gốc = master (copy đầy đủ + đổi link). */
+  function pickMasters(manifest, opts) {
+    var chosen = {};
+    if (opts.auto_master === false) return chosen;
+    var pat;
+    try { pat = new RegExp(opts.master_pattern || DEFAULT_MASTER_PATTERN, "i"); } catch (e) { pat = new RegExp(DEFAULT_MASTER_PATTERN, "i"); }
+    manifest.items.forEach(function (it) {
+      if (it.kind !== "file" || (it.mime !== SHEET_MIME && it.mime !== XLSX_MIME)) return;
+      if (pat.test(it.name) || it.parts.length === 1) chosen[it.id] = 1;
+    });
+    return chosen;
+  }
+  function mkOp(item, rules, kind, note) {
+    var dstName = rename(item.name, rules), dstParts = item.parts.map(function (p) { return rename(p, rules); });
+    return { kind: kind, item_kind: item.kind, src_id: item.id, src_name: item.name, src_parts: item.parts.slice(), src_path: item.path,
+      src_url: item.url || "", mime: item.mime, dst_mime: item.mime, dst_name: dstName, dst_parts: dstParts, dst_path: showPath(dstParts),
+      parent_parts: dstParts.slice(0, -1), depth: item.depth, size: item.bytes || 0, target_id: item.target_id || "",
+      renamed: dstName !== item.name, master: false, remap: false, note: note };
+  }
+  function collisions(ops) {
+    var seen = {}, order = [];
+    ops.forEach(function (o) {
+      var k = JSON.stringify([o.parent_parts, o.dst_name, o.kind === "folder"]);
+      if (!seen[k]) { seen[k] = []; order.push(k); }
+      seen[k].push(o.src_name);
+    });
+    var out = [];
+    order.forEach(function (k) {
+      var srcs = seen[k];
+      if (srcs.length > 1) {
+        var p = JSON.parse(k), uniq = srcs.filter(function (x, i) { return srcs.indexOf(x) === i; }).sort();
+        out.push("Trùng tên sau khi đổi: " + srcs.length + " mục → '" + p[1] + "' trong " + showPath(p[0]) + " (" + uniq.join(", ").slice(0, 160) + ")");
+      }
+    });
+    return out.slice(0, 30);
+  }
+  function buildPlan(manifest, opts) {
+    opts = normalizeOptions(opts);
+    var rules = opts.rename_rules, masters = pickMasters(manifest, opts), modes = Object.assign({}, opts.item_modes);
+    var full = opts.content_mode === "full", remap = opts.remap_links;
+    // để trống B = My Drive: luôn tạo thư mục mới (tool chỉ ghi được vào thư mục do chính nó tạo)
+    var destId = parseId(opts.dest_parent) || MY_DRIVE;
+    if (destId === MY_DRIVE) opts.wrap_root = true;
+    var rootName = "";
+    if (opts.wrap_root) rootName = String(opts.new_root_name || "").trim() || rename(manifest.root.name, rules);
+    var ops = [], skippedParents = {};
+    var sorted = manifest.items.slice().sort(function (a, b) { return a.depth - b.depth || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0); });
+    sorted.forEach(function (item) {
+      var isFolder = item.kind === "folder", mode = modes[item.id], pk = key(item.parts);
+      if (skippedParents[key(item.parent_parts)]) {
+        if (isFolder) skippedParents[pk] = 1;
+        ops.push(mkOp(item, rules, "skip", "nằm trong thư mục bị loại trừ")); return;
+      }
+      if (item.id === destId) { skippedParents[pk] = 1; ops.push(mkOp(item, rules, "skip", "đây là thư mục ĐÍCH (nằm trong nguồn) — không copy chính nó")); return; }
+      if (mode === "skip") { if (isFolder) skippedParents[pk] = 1; ops.push(mkOp(item, rules, "skip", "bạn chọn bỏ qua")); return; }
+      if (isFolder) { ops.push(mkOp(item, rules, "folder", "")); return; }
+      if (item.kind === "shortcut") {
+        ops.push(opts.shortcut_mode === "skip" ? mkOp(item, rules, "skip", "shortcut — bỏ qua") : mkOp(item, rules, "shortcut", "trỏ sang bản mới nếu đích nằm trong cây"));
+        return;
+      }
+      var mime = item.mime, isMaster = !!masters[item.id], google = isGoogle(mime);
+      var want = mode || (full || isMaster ? "copy" : "skeleton"), op;
+      if (want === "copy") op = mkOp(item, rules, "copy", isMaster && !full ? "master — copy cả nội dung" : "");
+      else if (google && NATIVE_CREATABLE.indexOf(mime) < 0) {
+        var um = mode === "skeleton" ? "placeholder_doc" : opts.uncreatable_mode;
+        if (um === "skip") op = mkOp(item, rules, "skip", "Google API không tạo rỗng được kiểu này");
+        else if (um === "shortcut") { op = mkOp(item, rules, "shortcut", "kiểu đặc biệt → shortcut về bản gốc"); op.target_id = item.id; }
+        else { op = mkOp(item, rules, "skeleton", "kiểu đặc biệt → tạo Doc rỗng thay thế"); op.dst_mime = DOC_MIME; }
+      } else if (!google && mode == null && opts.binary_mode === "skip") op = mkOp(item, rules, "skip", "file nhị phân — bỏ qua");
+      else op = mkOp(item, rules, "skeleton", "");
+      op.master = isMaster;
+      op.remap = op.kind === "copy" && (mime === SHEET_MIME || mime === XLSX_MIME) && (remap === "all" || (remap === "masters" && isMaster));
+      ops.push(op);
+    });
+    var counts = {};
+    ops.forEach(function (o) { counts[o.kind] = (counts[o.kind] || 0) + 1; });
+    var active = ops.filter(function (o) { return o.kind !== "skip"; });
+    var rootRenamed = !!rootName && rootName !== manifest.root.name;
+    return {
+      created_at: nowIso(), source: manifest.root, dest_parent: destId, wrap_root: !!opts.wrap_root, new_root_name: rootName,
+      root_renamed: rootRenamed, options: opts, ops: ops, warnings: ruleProblems(rules).concat(collisions(active)),
+      stats: { folders: counts.folder || 0, skeleton: counts.skeleton || 0, copy: counts.copy || 0, shortcut: counts.shortcut || 0, skip: counts.skip || 0,
+        renamed: active.filter(function (o) { return o.renamed; }).length + (rootRenamed ? 1 : 0),
+        remap: active.filter(function (o) { return o.remap; }).length,
+        bytes_copy: active.reduce(function (s, o) { return s + (o.kind === "copy" ? o.size : 0); }, 0), total: ops.length, active: active.length },
+    };
+  }
+
+  // ======================================================================== 4. CLONE
+  var STATUS_LABEL = { CREATED: "tạo thư mục mới", MERGED: "gộp vào thư mục có sẵn", COPIED: "copy đầy đủ", SKELETON: "tạo vỏ rỗng",
+    SHORTCUT: "tạo shortcut", EXISTS: "đã có ở đích — giữ nguyên", SKIPPED: "bỏ qua", ERROR: "lỗi" };
+
+  /** Tạo bản sao. Các mục CÙNG TẦNG chạy song song; tầng sau chỉ bắt đầu khi tầng trước xong để thư mục cha luôn có
+   *  trước. Shortcut làm sau cùng để trỏ được sang bản mới dù đích nằm sâu hơn. Change Log giữ đúng thứ tự kế hoạch. */
+  async function execute(backend, plan, o) {
+    o = o || {};
+    var log = o.log || noop, progress = o.progress || noop, shouldStop = o.shouldStop || function () { return false; };
+    var opts = plan.options, dry = !!opts.dry_run, skipExisting = opts.skip_existing !== false;
+    var destParent = plan.dest_parent;
+    if (!destParent) throw new Error("Chưa nhập thư mục ĐÍCH (B).");
+    if (destParent === plan.source.id) throw new Error("Thư mục đích đang trùng thư mục nguồn.");
+    var dest;
+    try { dest = await backend.getFile(destParent); } catch (e) { throw new Error("Không mở được thư mục B — " + (e.message || e)); }
+    if (dest.mimeType !== FOLDER_MIME) throw new Error("Link ĐÍCH không phải thư mục: " + (dest.name || destParent));
+    var destName = dest.name || "", srcName = plan.source.name;
+    var fresh = {}, listing = {}, counter = 0, workers = Math.max(1, Math.min(opts.workers || 4, 8));
+
+    async function children(pid) {
+      if (fresh[pid]) return [];
+      if (!listing[pid]) listing[pid] = backend.listChildren(pid);       // lưu Promise → nhiều luồng chờ chung 1 lần gọi
+      return listing[pid];
+    }
+    async function findExisting(pid, name, isFolder) {
+      var kids = await children(pid);
+      for (var i = 0; i < kids.length; i++) if (kids[i].name === name && (kids[i].mimeType === FOLDER_MIME) === isFolder) return kids[i];
+      return null;
+    }
+    function make(kind, args, srcId) {
+      counter++;
+      if (dry) return Promise.resolve("DRY" + ("0000" + counter).slice(-5));
+      var props = srcId ? { gdk_src: srcId } : null;
+      if (kind === "folder") return backend.createFolder(args[0], args[1], props);
+      if (kind === "empty") return backend.createEmpty(args[0], args[1], args[2], props);
+      if (kind === "shortcut") return backend.createShortcut(args[0], args[1], args[2], props);
+      return backend.copyFile(args[0], args[1], args[2], props);
+    }
+    var rootPrefix = [destName], entries = [];
+    function entry(op, status, newId, note) {
+      newId = newId || "";
+      var kind = op.item_kind || "folder", newMime = op.dst_mime || FOLDER_MIME, dryId = newId.indexOf("DRY") === 0;
+      return { time: nowIso().replace("T", " "), type: kind === "folder" ? "Folder" : kind === "shortcut" ? "Shortcut" : "File", status: status,
+        renamed: op.renamed ? "YES" : "", old_name: op.src_name, new_name: op.dst_name,
+        old_path: [srcName].concat(op.src_parts || []).join(LOG_SEP), new_path: rootPrefix.concat(op.dst_parts || []).join(LOG_SEP),
+        note: note || op.note || "", mime: op.mime || FOLDER_MIME, size: kind === "file" ? (op.size === undefined ? "" : op.size) : "",
+        old_link: op.src_url || "", new_link: newId && !dryId ? viewUrl(newId, newMime) : "", src_id: op.src_id, new_id: dryId ? "" : newId };
+    }
+    // -- thư mục gốc
+    var rootOp = { item_kind: "folder", src_name: srcName, dst_name: plan.new_root_name, src_parts: [], dst_parts: [], src_id: plan.source.id,
+      src_url: plan.source.url || "", renamed: plan.root_renamed };
+    var rootId;
+    if (plan.wrap_root) {
+      rootPrefix.push(plan.new_root_name);
+      var ex0 = skipExisting ? await findExisting(destParent, plan.new_root_name, true) : null;
+      if (ex0) { rootId = ex0.id; log("Gộp vào thư mục có sẵn ở đích: " + plan.new_root_name); entries.push(entry(rootOp, "MERGED", rootId, "thư mục gốc đã có ở đích — gộp vào")); }
+      else {
+        rootId = await make("folder", [plan.new_root_name, destParent], plan.source.id);
+        fresh[rootId] = 1; log("Tạo thư mục gốc: " + plan.new_root_name);
+        entries.push(entry(rootOp, "CREATED", rootId, "thư mục gốc của bản sao"));
+      }
+    } else rootId = destParent;
+
+    var pathMap = {}; pathMap[key([])] = rootId;
+    var idMap = {}; idMap[plan.source.id] = rootId;
+    var done = [], existing = [], failed = [], foreign = [], stopped = false;
+    var order = plan.ops.slice().sort(function (a, b) {
+      var sa = a.kind === "shortcut" ? 1 : 0, sb = b.kind === "shortcut" ? 1 : 0;
+      return sa - sb || a.depth - b.depth || (a.dst_path < b.dst_path ? -1 : a.dst_path > b.dst_path ? 1 : 0);
+    });
+    var total = order.filter(function (x) { return x.kind !== "skip"; }).length, n = 0;
+    progress(0, total);
+
+    async function process(op) {
+      var parentId = pathMap[key(op.parent_parts)];
+      try {
+        if (parentId == null) { failed.push(Object.assign({}, op, { error: "thư mục cha không tạo được" })); return entry(op, "ERROR", "", "thư mục cha không tạo được"); }
+        var isFolder = op.kind === "folder";
+        var ex = skipExisting ? await findExisting(parentId, op.dst_name, isFolder) : null;
+        if (ex) {
+          var ours = (ex.appProperties || {})[PROP_SRC] === op.src_id;
+          idMap[op.src_id] = ex.id;
+          if (isFolder) { pathMap[key(op.dst_parts)] = ex.id; return entry(op, "MERGED", ex.id, "thư mục đã có ở đích — gộp vào"); }
+          if (ours) existing.push(Object.assign({}, op, { dst_id: ex.id })); else foreign.push(op.src_id);
+          return entry(op, "EXISTS", ex.id, ours ? "đã clone ở lần chạy trước" : "đích đã có file cùng tên — giữ nguyên, không ghi đè");
+        }
+        var newId, status;
+        if (isFolder) { newId = await make("folder", [op.dst_name, parentId], op.src_id); status = "CREATED"; }
+        else if (op.kind === "skeleton") { newId = await make("empty", [op.dst_name, op.dst_mime, parentId], op.src_id); status = "SKELETON"; }
+        else if (op.kind === "copy") { newId = await make("copy", [op.src_id, op.dst_name, parentId], op.src_id); status = "COPIED"; }
+        else {
+          var target = idMap[op.target_id] || op.target_id || op.src_id;
+          newId = await make("shortcut", [op.dst_name, target, parentId], op.src_id); status = "SHORTCUT";
+        }
+        if (isFolder) { fresh[newId] = 1; pathMap[key(op.dst_parts)] = newId; }
+        idMap[op.src_id] = newId;
+        done.push(Object.assign({}, op, { dst_id: newId }));
+        return entry(op, status, newId);
+      } catch (exc) {
+        var msg = String((exc && exc.message) || exc);
+        failed.push(Object.assign({}, op, { error: msg }));
+        log("  LỖI: " + op.dst_path + " → " + msg, "error");
+        return entry(op, "ERROR", "", msg);
+      } finally {
+        n++; progress(n, total);
+        if (n % 25 === 0) log("  … " + n + " / " + total + " mục");
+      }
+    }
+    // gom theo tầng
+    var groups = [];
+    order.forEach(function (op) {
+      var gk = (op.kind === "shortcut" ? "s" : "n") + op.depth;
+      if (!groups.length || groups[groups.length - 1].k !== gk) groups.push({ k: gk, ops: [] });
+      groups[groups.length - 1].ops.push(op);
+    });
+    for (var g = 0; g < groups.length && !stopped; g++) {
+      var group = groups[g].ops, slots = new Array(group.length), todo = [];
+      for (var i = 0; i < group.length; i++) {
+        if (group[i].kind === "skip") { slots[i] = entry(group[i], "SKIPPED"); continue; }
+        if (stopped || shouldStop()) { stopped = true; break; }
+        todo.push(i);
+      }
+      var res = await mapLimit(todo, workers, function (idx) { return process(group[idx]); });
+      todo.forEach(function (idx, k) { slots[idx] = res[k]; });
+      slots.forEach(function (x) { if (x) entries.push(x); });
+      if (stopped) log("Đã dừng theo yêu cầu — " + n + " / " + total + " mục đã xử lý.", "error");
+    }
+    log("Xong phần tạo: " + done.length + " mục mới, " + (existing.length + foreign.length) + " mục đã có, " + failed.length + " lỗi" + (dry ? " (CHẠY THỬ)" : ""));
+    return { root_id: rootId, root_url: String(rootId).indexOf("DRY") === 0 ? "" : viewUrl(rootId, FOLDER_MIME),
+      root_name: plan.wrap_root ? plan.new_root_name : destName, dest_name: destName, dry_run: dry, stopped: stopped, id_map: idMap,
+      done: done, existing: existing, foreign: foreign, failed: failed, entries: entries, finished_at: nowIso() };
+  }
+
+  // ======================================================================== 5. ĐỔI LINK
+  function findIds(text) { var out = [], m, re = new RegExp(ID_IN_URL.source, "g"); while ((m = re.exec(text || ""))) out.push(m[1]); return out; }
+  /** Đổi mọi ID Drive nằm trong ngữ cảnh URL. Trả [text_mới, số_lần_đổi]. */
+  function remapText(text, idMap) {
+    var hits = 0;
+    var out = String(text || "").replace(new RegExp(ID_IN_URL.source, "g"), function (m0, old) {
+      var nw = idMap[old];
+      if (!nw || nw === old) return m0;
+      hits++; return m0.replace(old, nw);
+    });
+    return [out, hits];
+  }
+  function remapCell(cell, idMap) {
+    var patch = {}, fields = [], total = 0;
+    var uev = cell.userEnteredValue || {}, formula = uev.formulaValue;
+    if (formula && formula.toUpperCase().indexOf("HYPERLINK") >= 0) {
+      var r = remapText(formula, idMap);
+      if (r[1]) { patch.userEnteredValue = { formulaValue: r[0] }; fields.push("userEnteredValue"); total += r[1]; }
+    }
+    if (cell.textFormatRuns) {
+      var k = 0, runs = cell.textFormatRuns.map(function (run) {
+        run = clone(run);
+        var uri = ((run.format || {}).link || {}).uri;
+        if (uri) { var rr = remapText(uri, idMap); if (rr[1]) { run.format.link.uri = rr[0]; k += rr[1]; } }
+        return run;
+      });
+      if (k) {
+        patch.textFormatRuns = runs;
+        if (!patch.userEnteredValue && Object.keys(uev).length) patch.userEnteredValue = uev;
+        ["userEnteredValue", "textFormatRuns"].forEach(function (f) { if (fields.indexOf(f) < 0) fields.push(f); });
+        total += k;
+      }
+    }
+    var link = (((cell.userEnteredFormat || {}).textFormat) || {}).link;
+    if (link && link.uri) {
+      var r3 = remapText(link.uri, idMap);
+      if (r3[1]) { patch.userEnteredFormat = { textFormat: { link: { uri: r3[0] } } }; fields.push("userEnteredFormat.textFormat.link"); total += r3[1]; }
+    }
+    return [patch, fields, total];
+  }
+  async function remapSheet(backend, spreadsheetId, idMap) {
+    var doc = await backend.sheetsGet(spreadsheetId), requests = [], changed = 0;
+    (doc.sheets || []).forEach(function (sheet) {
+      var sid = sheet.properties.sheetId;
+      (sheet.data || []).forEach(function (grid) {
+        var r0 = grid.startRow || 0, c0 = grid.startColumn || 0;
+        (grid.rowData || []).forEach(function (row, ri) {
+          (row.values || []).forEach(function (cell, ci) {
+            var res = remapCell(cell, idMap);
+            if (!res[2]) return;
+            changed += res[2];
+            requests.push({ updateCells: { start: { sheetId: sid, rowIndex: r0 + ri, columnIndex: c0 + ci }, rows: [{ values: [res[0]] }], fields: res[1].join(",") } });
+          });
+        });
+      });
+    });
+    if (requests.length) await backend.sheetsBatchUpdate(spreadsheetId, requests);
+    return { links_changed: changed, cells_touched: requests.length };
+  }
+  /** File được phép đổi link: tạo mới lượt này + bản do tool tạo ở lượt trước. File có sẵn của người dùng KHÔNG BAO GIỜ bị sửa. */
+  function remapTargets(result) { return result.done.concat(result.existing).filter(function (o) { return o.remap; }); }
+  async function remapAll(backend, plan, result, o) {
+    o = o || {};
+    var log = o.log || noop, shouldStop = o.shouldStop || function () { return false; };
+    var stats = { files: 0, links_changed: 0, errors: [] };
+    if (result.dry_run) return stats;
+    var targets = remapTargets(result);
+    for (var i = 0; i < targets.length; i++) {
+      if (shouldStop()) break;
+      var op = targets[i], n;
+      try {
+        if (op.dst_mime === SHEET_MIME) n = (await remapSheet(backend, op.dst_id, result.id_map)).links_changed;
+        else if (op.dst_mime === XLSX_MIME) n = await backend.xlsxRemap(op.dst_id, result.id_map);    // giải nén / sửa XML / nén lại ở server
+        else continue;
+        stats.files++; stats.links_changed += n;
+        log("  Đổi " + n + " link trong '" + op.dst_name + "'");
+      } catch (exc) {
+        stats.errors.push({ file: op.dst_name, error: String(exc.message || exc) });
+        log("  LỖI đổi link " + op.dst_name + ": " + (exc.message || exc), "error");
+      }
+    }
+    return stats;
+  }
+
+  // ======================================================================== 6. TAB MỤC LỤC
+  function row(texts, link) {
+    var values = texts.map(function (t) { return { userEnteredValue: { stringValue: String(t) } }; });
+    if (link) values.push({ userEnteredValue: { stringValue: link[0] }, textFormatRuns: [{ startIndex: 0, format: { link: { uri: link[1] } } }] });
+    return { values: values };
+  }
+  var kindLabel = function (op) { return { skeleton: "vỏ rỗng", copy: "bản đầy đủ", shortcut: "shortcut" }[op.kind] || op.kind; };
+  async function buildIndexTab(backend, plan, result, o) {
+    var log = (o && o.log) || noop;
+    if (result.dry_run) return { skipped: "chạy thử" };
+    var placed = result.done.concat(result.existing);
+    var targets = placed.filter(function (x) { return x.master && x.kind === "copy" && x.dst_mime === SHEET_MIME; });
+    if (!targets.length) return { skipped: "không có master là Google Sheet" };
+    var sheetId = targets[0].dst_id, meta = await backend.sheetsMeta(sheetId), existing = {}, maxId = 0;
+    (meta.sheets || []).forEach(function (s) { existing[s.properties.title] = s.properties.sheetId; maxId = Math.max(maxId, s.properties.sheetId); });
+    var tabId = existing[INDEX_TITLE];
+    if (tabId == null) { tabId = maxId + 1000; await backend.sheetsBatchUpdate(sheetId, [{ addSheet: { properties: { sheetId: tabId, title: INDEX_TITLE } } }]); }
+    var rows = [row(["THƯ MỤC", "TÊN MỤC", "LOẠI", "LINK"])];
+    placed.slice().sort(function (a, b) { return a.depth - b.depth || (a.dst_path < b.dst_path ? -1 : 1); }).forEach(function (op) {
+      if (op.kind === "folder") return;
+      rows.push(row([showPath(op.parent_parts), op.dst_name, kindLabel(op)], [op.dst_name, viewUrl(op.dst_id, op.dst_mime)]));
+    });
+    await backend.sheetsBatchUpdate(sheetId, [{ updateCells: { start: { sheetId: tabId, rowIndex: 0, columnIndex: 0 }, rows: rows, fields: "userEnteredValue,textFormatRuns" } }]);
+    log("Tạo tab " + INDEX_TITLE + " trong '" + targets[0].dst_name + "' — " + (rows.length - 1) + " dòng");
+    return { sheet: targets[0].dst_name, tab: INDEX_TITLE, rows: rows.length - 1 };
+  }
+
+  // ======================================================================== 7. HẬU KIỂM
+  function chk(id, name, status, detail, rows) { return { id: id, name: name, status: status, detail: detail, rows: rows || [] }; }
+  function sheetCellCount(doc) {
+    var n = 0;
+    (doc.sheets || []).forEach(function (s) { (s.data || []).forEach(function (g) { (g.rowData || []).forEach(function (r) { (r.values || []).forEach(function (c) { if (c.userEnteredValue) n++; }); }); }); });
+    return n;
+  }
+  async function linksOf(backend, fileId, mime) {
+    var urls = [];
+    if (mime === SHEET_MIME) {
+      var doc = await backend.sheetsGet(fileId);
+      (doc.sheets || []).forEach(function (s) {
+        if (s.properties.title === INDEX_TITLE) return;
+        (s.data || []).forEach(function (g) { (g.rowData || []).forEach(function (r) { (r.values || []).forEach(function (cell) {
+          var uev = cell.userEnteredValue || {};
+          if (uev.formulaValue) urls.push(uev.formulaValue);
+          if (cell.hyperlink) urls.push(cell.hyperlink);
+          var fl = ((cell.userEnteredFormat || {}).textFormat || {}).link;
+          if (fl && fl.uri) urls.push(fl.uri);
+          (cell.textFormatRuns || []).forEach(function (run) { var u = ((run.format || {}).link || {}).uri; if (u) urls.push(u); });
+        }); }); });
+      });
+    } else if (mime === XLSX_MIME) urls = await backend.xlsxLinks(fileId);
+    return urls;
+  }
+  function report(plan, result, checks, dest) {
+    var s = { PASS: 0, FAIL: 0, WARN: 0, SKIP: 0 };
+    checks.forEach(function (c) { s[c.status] = (s[c.status] || 0) + 1; });
+    return { ran_at: nowIso(), source: plan.source, dest: { id: result.root_id, name: result.root_name || "", url: result.root_url || "" },
+      plan_stats: plan.stats, dest_stats: dest ? dest.stats : {}, checks: checks, summary: s, ok: s.FAIL === 0 };
+  }
+  async function verify(backend, manifest, plan, result, o) {
+    var log = (o && o.log) || noop;
+    if (result.dry_run) return report(plan, result, [chk("C0", "Chạy thử", "SKIP", "Chạy thử — chưa tạo gì trên Drive nên không hậu kiểm.")]);
+    if (result.stopped) return report(plan, result, [chk("C0", "Đã dừng giữa chừng", "SKIP",
+      "Bấm 'Clone thật' lần nữa với cùng thiết lập để chạy tiếp — mục đã có ở đích sẽ được bỏ qua, không tạo trùng.")]);
+    log("Quét lại thư mục ĐÍCH để đối chiếu độc lập…");
+    var dest = await scan(backend, result.root_id, { workers: plan.options.workers });
+    var byParts = {};
+    dest.items.forEach(function (i) { byParts[key(i.parts)] = i; });
+    var expected = plan.ops.filter(function (x) { return x.kind !== "skip"; });
+    var created = {}; result.done.forEach(function (x) { created[x.src_id] = 1; });
+    var foreign = {}; (result.foreign || []).forEach(function (x) { foreign[x] = 1; });
+    var srcBytes = {}; manifest.items.forEach(function (i) { srcBytes[i.id] = i.bytes; });
+    var checks = [], got;
+
+    // C1 — cây thư mục
+    var expFolders = expected.filter(function (x) { return x.kind === "folder"; });
+    var missing = expFolders.filter(function (x) { return !byParts[key(x.dst_parts)]; }).map(function (x) { return x.dst_path; });
+    checks.push(chk("C1", "Cây thư mục dựng đủ", missing.length ? "FAIL" : "PASS", (expFolders.length - missing.length) + "/" + expFolders.length + " thư mục có mặt ở đích.",
+      missing.slice(0, 50).map(function (m) { return { "Thiếu": m }; })));
+    // C2 — file đúng tên + đúng loại
+    var expFiles = expected.filter(function (x) { return x.kind !== "folder"; }), bad = [];
+    expFiles.forEach(function (x) {
+      got = byParts[key(x.dst_parts)];
+      if (!got) bad.push({ "Mục": x.dst_path, "Lỗi": "không tìm thấy" });
+      else if (!foreign[x.src_id] && x.kind !== "shortcut" && got.mime !== x.dst_mime) bad.push({ "Mục": x.dst_path, "Lỗi": "sai kiểu: chờ " + x.dst_mime + " nhận " + got.mime });
+    });
+    var d2 = (expFiles.length - bad.length) + "/" + expFiles.length + " file khớp tên và loại.";
+    if (Object.keys(foreign).length) d2 += " (" + Object.keys(foreign).length + " file trùng tên đã có sẵn ở đích được giữ nguyên.)";
+    checks.push(chk("C2", "File đúng tên và đúng loại", bad.length ? "FAIL" : "PASS", d2, bad.slice(0, 50)));
+    // C3 — vỏ rỗng KHÔNG lọt nội dung (Google Doc rỗng vẫn tốn dung lượng → đọc nội dung thật)
+    var skeletons = expected.filter(function (x) { return x.kind === "skeleton" && created[x.src_id]; }), leaked = [], unchecked = 0;
+    for (var i = 0; i < skeletons.length; i++) {
+      var sk = skeletons[i]; got = byParts[key(sk.dst_parts)];
+      if (!got) continue;
+      if (got.mime === SHEET_MIME) {
+        try { if (sheetCellCount(await backend.sheetsGet(got.id)) > 0) leaked.push({ "Mục": sk.dst_path, "Lỗi": "Sheet có dữ liệu" }); } catch (e) { unchecked++; }
+      } else if (got.mime === DOC_MIME || got.mime === SLIDE_MIME) {
+        var text = await backend.exportText(got.id);
+        if (text == null) unchecked++;
+        else if (text.trim()) leaked.push({ "Mục": sk.dst_path, "Lỗi": "còn " + text.trim().length + " ký tự nội dung" });
+      } else if (isGoogle(got.mime)) unchecked++;
+      else if (got.bytes > 0) leaked.push({ "Mục": sk.dst_path, "Lỗi": got.bytes + " byte (phải = 0)" });
+    }
+    if (skeletons.length) {
+      var d3 = (skeletons.length - leaked.length) + "/" + skeletons.length + " file vỏ rỗng đúng nghĩa.";
+      if (unchecked) d3 += " (" + unchecked + " file kiểu đặc biệt không đọc được nội dung để kiểm.)";
+      checks.push(chk("C3", "File vỏ KHÔNG chứa nội dung", leaked.length ? "FAIL" : "PASS", d3, leaked.slice(0, 50)));
+    } else checks.push(chk("C3", "File vỏ KHÔNG chứa nội dung", "SKIP", "Lượt này không tạo file vỏ nào."));
+    // C4 — bản đầy đủ copy trọn nội dung
+    var copies = expected.filter(function (x) { return x.kind === "copy" && created[x.src_id]; }), short = [];
+    for (var j = 0; j < copies.length; j++) {
+      var cp = copies[j]; got = byParts[key(cp.dst_parts)];
+      if (!got) continue;
+      if (got.mime === SHEET_MIME && cp.remap) {
+        try { if (sheetCellCount(await backend.sheetsGet(got.id)) === 0) short.push({ "Mục": cp.dst_path, "Lỗi": "Sheet bản sao bị rỗng" }); } catch (e) { /* bỏ qua */ }
+      } else if (!isGoogle(got.mime)) {
+        var want = srcBytes[cp.src_id] || 0;
+        if (want && got.bytes !== want && !cp.remap) short.push({ "Mục": cp.dst_path, "Lỗi": "dung lượng lệch: nguồn " + want + " byte, bản sao " + got.bytes + " byte" });
+        else if (want && got.bytes === 0) short.push({ "Mục": cp.dst_path, "Lỗi": "bản sao 0 byte" });
+      }
+    }
+    if (copies.length) checks.push(chk("C4", "Bản đầy đủ copy trọn nội dung", short.length ? "FAIL" : "PASS", (copies.length - short.length) + "/" + copies.length + " file copy đủ nội dung.", short.slice(0, 50)));
+    else if (plan.options.content_mode === "skeleton" && !result.existing.length) checks.push(chk("C4", "Bản đầy đủ copy trọn nội dung", "WARN", "Không có file nào được chọn copy đầy đủ (master sheet)."));
+    else checks.push(chk("C4", "Bản đầy đủ copy trọn nội dung", "SKIP", "Lượt này không copy file mới."));
+    // C5 + C6 — link trong file đã đổi link
+    var targets = remapTargets(result), idMap = result.id_map, oldIds = {}, newIds = {}, destIds = {};
+    Object.keys(idMap).forEach(function (k) { oldIds[k] = 1; newIds[idMap[k]] = 1; });
+    dest.items.forEach(function (i) { destIds[i.id] = 1; }); destIds[result.root_id] = 1;
+    var stale = [], broken = [], okLinks = 0, external = 0;
+    for (var t = 0; t < targets.length; t++) {
+      got = byParts[key(targets[t].dst_parts)];
+      if (!got) continue;
+      var urls = await linksOf(backend, got.id, got.mime);
+      urls.forEach(function (url) {
+        findIds(url).forEach(function (fid) {
+          if (newIds[fid] && !oldIds[fid]) { okLinks++; if (!destIds[fid]) broken.push({ "File": targets[t].dst_name, "Link": url.slice(0, 200), "Lỗi": "trỏ ra ngoài cây mới" }); }
+          else if (oldIds[fid] && !newIds[fid]) stale.push({ "File": targets[t].dst_name, "Link": url.slice(0, 200), "Lỗi": "vẫn trỏ về bản GỐC" });
+          else external++;
+        });
+      });
+    }
+    if (targets.length) {
+      checks.push(chk("C5", "Link đã trỏ sang cây MỚI", stale.length ? "FAIL" : "PASS", targets.length + " file đã đổi link: " + okLinks + " link trỏ đúng cây mới, " + stale.length + " link còn trỏ bản gốc, " + external + " link ngoài.", stale.slice(0, 50)));
+      checks.push(chk("C6", "Không có link gãy", broken.length ? "FAIL" : "PASS", broken.length ? broken.length + " link trỏ tới mục không tồn tại." : "Mọi đích đến của link đều tồn tại trong cây mới.", broken.slice(0, 50)));
+    } else {
+      var why = plan.options.remap_links === "off" ? "Đang tắt đổi link." : "Không có Sheet/xlsx nào cần đổi link.";
+      checks.push(chk("C5", "Link đã trỏ sang cây MỚI", "SKIP", why)); checks.push(chk("C6", "Không có link gãy", "SKIP", why));
+    }
+    // C7 — mục lạ ở đích (không tính Change Log của các lần chạy)
+    var expParts = {}; expected.forEach(function (x) { expParts[key(x.dst_parts)] = 1; });
+    var extra = dest.items.filter(function (it) {
+      if (expParts[key(it.parts)] || it.name.indexOf(LOG_PREFIX) === 0) return false;
+      for (var k = 1; k < it.parts.length; k++) if (!expParts[key(it.parts.slice(0, k))]) return false;   // cha đã bị tính là lạ
+      return true;
+    }).map(function (it) { return it.path; });
+    checks.push(chk("C7", "Không có mục lạ ở đích", extra.length ? "WARN" : "PASS", extra.length ? extra.length + " mục ở đích không thuộc kế hoạch (thường là thứ có sẵn trong B)." : "Đích khớp đúng kế hoạch.",
+      extra.slice(0, 50).map(function (e) { return { "Mục lạ": e }; })));
+    // C8 — lỗi lúc tạo
+    checks.push(chk("C8", "Không có thao tác lỗi", result.failed.length ? "FAIL" : "PASS", result.failed.length ? result.failed.length + " thao tác thất bại." : "Tất cả thao tác thành công.",
+      result.failed.slice(0, 50).map(function (f) { return { "Mục": f.dst_path, "Lỗi": f.error || "" }; })));
+    // C9 — đổi tên: quét lại tên THẬT ở đích, không tin tên tool đã tính
+    var checkable = plan.options.rename_rules.filter(function (r) {
+      if (r.regex) return false;
+      var to = r.to || "";
+      return r.ignore_case ? to.toLowerCase().indexOf(r.from.toLowerCase()) < 0 : to.indexOf(r.from) < 0;
+    });
+    if (checkable.length) {
+      var names = dest.items.filter(function (it) { return idMap.hasOwnProperty((it.props || {})[PROP_SRC]); }).map(function (it) { return [it.path, it.name]; });
+      if (plan.wrap_root) names.push([plan.new_root_name, plan.new_root_name]);
+      var left = [];
+      names.forEach(function (pn) {
+        checkable.forEach(function (r) {
+          var hit = r.ignore_case ? pn[1].toLowerCase().indexOf(r.from.toLowerCase()) >= 0 : pn[1].indexOf(r.from) >= 0;
+          if (hit) left.push({ "Mục": pn[0], "Còn chứa": r.from });
+        });
+      });
+      checks.push(chk("C9", "Không còn tên chứa chuỗi cần đổi", left.length ? "FAIL" : "PASS",
+        left.length ? left.length + " tên vẫn còn chuỗi cũ." : "Đã soát " + names.length + " tên do tool tạo ở đích theo " + checkable.length + " quy tắc.", left.slice(0, 50)));
+    } else checks.push(chk("C9", "Không còn tên chứa chuỗi cần đổi", "SKIP", "Không có quy tắc đổi tên dạng chuỗi để soát."));
+    return report(plan, result, checks, dest);
+  }
+
+  // ======================================================================== 8. CHANGE LOG
+  var HEADERS = ["Time", "Type", "Status", "Renamed", "Old Name", "New Name", "Old Path", "New Path", "Note", "MIME Type", "Size (bytes)", "Old Link", "New Link", "Source ID", "New ID"];
+  var KEYS = ["time", "type", "status", "renamed", "old_name", "new_name", "old_path", "new_path", "note", "mime", "size", "old_link", "new_link", "src_id", "new_id"];
+  var WIDTHS = [140, 70, 90, 70, 260, 260, 360, 360, 260, 220, 90, 240, 240, 140, 140];
+  var COUNT_LABELS = [["folders_created", "Thư mục tạo mới"], ["folders_merged", "Thư mục gộp vào có sẵn"], ["files_copied", "File copy đầy đủ"],
+    ["skeletons", "File vỏ rỗng"], ["shortcuts", "Shortcut"], ["exists", "Đã có ở đích (bỏ qua)"], ["skipped", "Bỏ qua theo thiết lập"],
+    ["errors", "Lỗi"], ["renamed", "Mục được đổi tên"], ["total", "Tổng số dòng"]];
+  function summarize(entries) {
+    var c = {}; Object.keys(STATUS_LABEL).forEach(function (k) { c[k] = 0; });
+    var renamed = 0;
+    entries.forEach(function (e) { c[e.status] = (c[e.status] || 0) + 1; if (e.renamed && e.status !== "SKIPPED" && e.status !== "ERROR") renamed++; });
+    return { folders_created: c.CREATED, folders_merged: c.MERGED, files_copied: c.COPIED, skeletons: c.SKELETON, shortcuts: c.SHORTCUT,
+      exists: c.EXISTS, skipped: c.SKIPPED, errors: c.ERROR, renamed: renamed, total: entries.length };
+  }
+  /** Chuỗi bắt đầu bằng = + - @ → thêm ' để Excel không chạy như công thức (tên file do người khác đặt). */
+  function safe(v) {
+    if (typeof v === "string" && /^[=+\-@\t\r]/.test(v) && isNaN(parseFloat(v))) return "'" + v;
+    return v;
+  }
+  function toCsv(entries) {
+    var q = function (v) { v = v == null ? "" : String(safe(v)); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    return [HEADERS.join(",")].concat(entries.map(function (e) { return KEYS.map(function (k) { return q(e[k]); }).join(","); })).join("\r\n") + "\r\n";
+  }
+  function sheetTitle(plan, started) { return LOG_PREFIX + plan.source.name + " – " + started.slice(0, 16).replace("T", " "); }
+  function summaryRows(plan, result, rep, counts, title) {
+    var o = plan.options;
+    var rules = o.rename_rules.map(function (r) { return '"' + r.from + '" → "' + (r.to || "") + '"' + (r.ignore_case ? " (không phân biệt hoa thường, giữ kiểu chữ)" : "") + (r.regex ? " (regex)" : ""); }).join("; ") || "(không đổi tên)";
+    var status = result.stopped ? "STOPPED — chạy lại để tiếp tục" : rep && !rep.ok ? "DONE — hậu kiểm có mục FAIL" : "DONE";
+    var rows = [[title, "", ""], ["", "", ""], ["Chế độ", result.dry_run ? "PREVIEW (chạy thử) — chưa tạo gì" : "CLONE", ""], ["Trạng thái", status, ""],
+      ["Nguồn (A)", plan.source.name, plan.source.url || ""], ["Đích (B)", result.dest_name || "", viewUrl(plan.dest_parent, FOLDER_MIME)],
+      ["Thư mục bản sao", result.root_name || "", result.root_url || ""],
+      ["Kiểu nội dung", o.content_mode === "full" ? "Copy toàn bộ dữ liệu" : "Chỉ dựng khung (file vỏ rỗng)", ""], ["Quy tắc đổi tên", rules, ""],
+      ["Trùng tên ở đích", o.skip_existing ? "Gộp thư mục, giữ nguyên file có sẵn" : "Luôn tạo mới", ""],
+      ["Đổi link", { off: "Tắt", masters: "Master sheet", all: "Mọi Sheet/xlsx được copy" }[o.remap_links], ""],
+      ["Kết thúc", String(result.finished_at || "").replace("T", " "), ""], ["", "", ""]];
+    COUNT_LABELS.forEach(function (cl) { rows.push([cl[1], counts[cl[0]] || 0, ""]); });
+    if (rep) {
+      var s = rep.summary;
+      rows.push(["", "", ""], ["Hậu kiểm", "PASS " + (s.PASS || 0) + " · FAIL " + (s.FAIL || 0) + " · WARN " + (s.WARN || 0) + " · SKIP " + (s.SKIP || 0), ""]);
+      rep.checks.forEach(function (c) { rows.push(["  " + c.id + " " + c.name, c.status, c.detail]); });
+    }
+    return rows;
+  }
+  function cellOf(v, link) {
+    if (typeof v === "number") return { userEnteredValue: { numberValue: v } };
+    v = v == null ? "" : String(v);
+    var cell = { userEnteredValue: { stringValue: v } };
+    if (link && v.indexOf("http") === 0) cell.textFormatRuns = [{ startIndex: 0, format: { link: { uri: v } } }];
+    return cell;
+  }
+  var rgb = function (h) { return { red: parseInt(h.slice(0, 2), 16) / 255, green: parseInt(h.slice(2, 4), 16) / 255, blue: parseInt(h.slice(4, 6), 16) / 255 }; };
+  /** Tạo Google Sheet Change Log (tab Summary + Change Log) trong thư mục đích. */
+  async function writeSheet(backend, parentId, title, summary, entries) {
+    var sid = await backend.createEmpty(title, SHEET_MIME, parentId, { gdk_kind: "changelog" });
+    var sheets = (await backend.sheetsMeta(sid)).sheets || [];
+    var logTab = sheets.length ? sheets[0].properties.sheetId : 0, sumTab = logTab + 7, n = entries.length;
+    var linkCols = [KEYS.indexOf("old_link"), KEYS.indexOf("new_link")];
+    await backend.sheetsBatchUpdate(sid, [
+      { updateSheetProperties: { properties: { sheetId: logTab, title: "Change Log", gridProperties: { rowCount: Math.max(n + 1, 2), columnCount: HEADERS.length, frozenRowCount: 1 } },
+        fields: "title,gridProperties.rowCount,gridProperties.columnCount,gridProperties.frozenRowCount" } },
+      { addSheet: { properties: { sheetId: sumTab, title: "Summary", index: 0, gridProperties: { rowCount: summary.length + 5, columnCount: 3 } } } },
+      { updateCells: { start: { sheetId: sumTab, rowIndex: 0, columnIndex: 0 }, rows: summary.map(function (r) { return { values: [cellOf(r[0]), cellOf(r[1]), cellOf(r[2], true)] }; }), fields: "userEnteredValue,textFormatRuns" } },
+      { updateCells: { start: { sheetId: logTab, rowIndex: 0, columnIndex: 0 }, rows: [{ values: HEADERS.map(function (h) { return cellOf(h); }) }], fields: "userEnteredValue" } },
+    ]);
+    for (var i = 0; i < n; i += 400) {          // mỗi lô 400 dòng 1 lần gọi để không vượt giới hạn dung lượng request
+      await backend.sheetsBatchUpdate(sid, [{ updateCells: { start: { sheetId: logTab, rowIndex: 1 + i, columnIndex: 0 },
+        rows: entries.slice(i, i + 400).map(function (e) { return { values: KEYS.map(function (k, j) { return cellOf(e[k] == null ? "" : e[k], linkCols.indexOf(j) >= 0); }) }; }),
+        fields: "userEnteredValue,textFormatRuns" } }]);
+    }
+    var reqs = [
+      { repeatCell: { range: { sheetId: logTab, startRowIndex: 0, endRowIndex: 1 }, cell: { userEnteredFormat: { backgroundColor: rgb("1f3864"), textFormat: { bold: true, foregroundColor: rgb("ffffff") } } }, fields: "userEnteredFormat(backgroundColor,textFormat)" } },
+      { repeatCell: { range: { sheetId: sumTab, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 1 }, cell: { userEnteredFormat: { textFormat: { bold: true, fontSize: 13 } } }, fields: "userEnteredFormat.textFormat" } },
+    ];
+    [[2, "ERROR", "f4c7c3"], [2, "EXISTS", "fce8b2"], [2, "SKIPPED", "fce8b2"], [2, "MERGED", "d2e3fc"], [3, "YES", "ceead6"]].forEach(function (x) {
+      reqs.push({ addConditionalFormatRule: { index: 0, rule: { ranges: [{ sheetId: logTab, startRowIndex: 1, startColumnIndex: x[0], endColumnIndex: x[0] + 1 }],
+        booleanRule: { condition: { type: "TEXT_EQ", values: [{ userEnteredValue: x[1] }] }, format: { backgroundColor: rgb(x[2]) } } } } });
+    });
+    WIDTHS.forEach(function (w, i) { reqs.push({ updateDimensionProperties: { range: { sheetId: logTab, dimension: "COLUMNS", startIndex: i, endIndex: i + 1 }, properties: { pixelSize: w }, fields: "pixelSize" } }); });
+    [230, 420, 460].forEach(function (w, i) { reqs.push({ updateDimensionProperties: { range: { sheetId: sumTab, dimension: "COLUMNS", startIndex: i, endIndex: i + 1 }, properties: { pixelSize: w }, fields: "pixelSize" } }); });
+    await backend.sheetsBatchUpdate(sid, reqs);
+    return { id: sid, url: viewUrl(sid, SHEET_MIME), title: title };
+  }
+
+  // ======================================================================== 9. CHẠY TRỌN 1 LƯỢT
+  /** clone → đổi link → mục lục → hậu kiểm → Change Log. hooks: {log(msg, level), progress(done, total), stage(name), shouldStop()} */
+  async function run(backend, manifest, options, hooks) {
+    hooks = hooks || {};
+    var log = hooks.log || noop, stage = hooks.stage || noop, shouldStop = hooks.shouldStop || function () { return false; };
+    var plan = buildPlan(manifest, options), o = plan.options, dry = !!o.dry_run, started = nowIso();
+    log("=== " + (dry ? "CHẠY THỬ (không tạo gì)" : "CLONE THẬT") + " — " + plan.source.name + " ===");
+    plan.warnings.forEach(function (w) { log("Cảnh báo: " + w, "error"); });
+    stage("clone");
+    var result = await execute(backend, plan, { log: log, progress: hooks.progress, shouldStop: shouldStop });
+    if (!dry) {
+      if (o.remap_links !== "off" && remapTargets(result).length) { stage("remap"); log("--- Đổi link sang cây mới ---"); result.remap = await remapAll(backend, plan, result, { log: log, shouldStop: shouldStop }); }
+      if (o.build_index && !result.stopped && !shouldStop()) {
+        stage("index");
+        try { result.index = await buildIndexTab(backend, plan, result, { log: log }); }
+        catch (e) { log("Không tạo được tab mục lục: " + (e.message || e), "error"); }
+      }
+    }
+    if (shouldStop()) result.stopped = true;
+    stage("verify");
+    if (!dry && !result.stopped) log("--- Hậu kiểm ---");
+    var rep = await verify(backend, manifest, plan, result, { log: log });
+    var counts = summarize(result.entries), logSheet = null;
+    if (o.write_log_sheet && !dry) {
+      stage("log");
+      var title = sheetTitle(plan, started);
+      try { logSheet = await writeSheet(backend, result.root_id, title, summaryRows(plan, result, rep, counts, title), result.entries); log("Đã ghi Change Log lên Drive: " + logSheet.title); }
+      catch (e) { log("Không ghi được Change Log lên Drive: " + (e.message || e), "error"); }    // log sheet hỏng không được làm mất kết quả clone
+    }
+    var s = rep.summary;
+    if (rep.checks[0].id !== "C0") log("Hậu kiểm: PASS " + (s.PASS || 0) + " · FAIL " + (s.FAIL || 0) + " · WARN " + (s.WARN || 0) + " · SKIP " + (s.SKIP || 0));
+    stage("done");
+    return { plan: plan, result: result, report: rep, counts: counts, log_sheet: logSheet, started_at: started, finished_at: nowIso(),
+      ok: rep.ok && !result.failed.length };
+  }
+
+  // ======================================================================== 10. DRIVE GIẢ LẬP (Demo + test)
+  function FakeDrive(seed) {
+    this.nodes = {}; this.calls = []; this.failIds = {}; this.seed = seed || 7;
+  }
+  FakeDrive.prototype._newId = function () {
+    var a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", s = "FK";
+    for (var i = 0; i < 26; i++) { this.seed = (this.seed * 16807) % 2147483647; s += a[this.seed % a.length]; }
+    return s;
+  };
+  FakeDrive.prototype._add = function (name, mime, parent, extra) {
+    var id = this._newId();
+    this.nodes[id] = Object.assign({ id: id, name: name, mimeType: mime, parents: parent ? [parent] : [], quotaBytesUsed: "0", trashed: false }, extra || {});
+    return id;
+  };
+  FakeDrive.prototype._public = function (n) {
+    var it = { id: n.id, name: n.name, mimeType: n.mimeType, quotaBytesUsed: n.quotaBytesUsed };
+    if (n.shortcutDetails) it.shortcutDetails = clone(n.shortcutDetails);
+    if (n.appProperties) it.appProperties = clone(n.appProperties);
+    if (!isGoogle(n.mimeType)) it.size = n.quotaBytesUsed || "0";
+    it.webViewLink = viewUrl(n.id, n.mimeType);
+    return it;
+  };
+  FakeDrive.prototype.whoami = async function () { return { emailAddress: "demo@local", displayName: "Chế độ DEMO (Drive giả lập)" }; };
+  FakeDrive.prototype.getFile = async function (id) {
+    if (id === MY_DRIVE && !this.nodes[MY_DRIVE]) this.nodes[MY_DRIVE] = { id: MY_DRIVE, name: "My Drive", mimeType: FOLDER_MIME, parents: [], quotaBytesUsed: "0", trashed: false };
+    var n = this.nodes[id];
+    if (!n || n.trashed) throw new Error("không tìm thấy file " + id);
+    var out = this._public(n); out.parents = n.parents.slice(); return out;
+  };
+  FakeDrive.prototype.listChildren = async function (id) {
+    var self = this;
+    return Object.keys(this.nodes).map(function (k) { return self.nodes[k]; })
+      .filter(function (n) { return n.parents.indexOf(id) >= 0 && !n.trashed; })
+      .sort(function (a, b) { return ((a.mimeType !== FOLDER_MIME) - (b.mimeType !== FOLDER_MIME)) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0); })
+      .map(function (n) { return self._public(n); });
+  };
+  FakeDrive.prototype._props = function (id, props) { if (props) this.nodes[id].appProperties = Object.assign({}, props); return id; };
+  FakeDrive.prototype.createFolder = async function (name, parent, props) { this.calls.push("createFolder"); return this._props(this._add(name, FOLDER_MIME, parent), props); };
+  FakeDrive.prototype.createEmpty = async function (name, mime, parent, props) {
+    this.calls.push("createEmpty");
+    if (isGoogle(mime) && NATIVE_CREATABLE.indexOf(mime) < 0) throw new Error("không tạo rỗng được kiểu " + mime);
+    var id = this._add(name, mime, parent, mime === SHEET_MIME ? { sheet: blankSheet(name) } : { blob: "" });
+    if (mime === SHEET_MIME) this.nodes[id].sheet.spreadsheetId = id;
+    return this._props(id, props);
+  };
+  FakeDrive.prototype.createShortcut = async function (name, target, parent, props) {
+    this.calls.push("createShortcut");
+    return this._props(this._add(name, SHORTCUT_MIME, parent, { shortcutDetails: { targetId: target } }), props);
+  };
+  FakeDrive.prototype.copyFile = async function (id, name, parent, props) {
+    this.calls.push("copyFile");
+    if (this.failIds[id]) throw new Error("HTTP 403 — The user does not have permission to copy this file.");
+    var src = this.nodes[id], extra = {};
+    if (src.sheet) extra.sheet = clone(src.sheet);
+    if (src.blob !== undefined) extra.blob = src.blob;
+    var nid = this._add(name, src.mimeType, parent, extra);
+    this.nodes[nid].quotaBytesUsed = src.quotaBytesUsed || "0";
+    if (extra.sheet) this.nodes[nid].sheet.spreadsheetId = nid;
+    return this._props(nid, props);
+  };
+  FakeDrive.prototype.exportText = async function (id) {
+    var n = this.nodes[id] || {};
+    return n.mimeType === DOC_MIME || n.mimeType === SLIDE_MIME ? String(n.blob || "") : null;
+  };
+  FakeDrive.prototype.xlsxRemap = async function (id, idMap) {
+    var r = remapText(this.nodes[id].blob || "", idMap);
+    if (r[1]) { this.nodes[id].blob = r[0]; this.nodes[id].quotaBytesUsed = String(r[0].length); }
+    return r[1];
+  };
+  FakeDrive.prototype.xlsxLinks = async function (id) { return [String((this.nodes[id] || {}).blob || "")]; };
+  FakeDrive.prototype.sheetsGet = async function (id) {
+    var n = this.nodes[id];
+    if (!n || !n.sheet) throw new Error(id + " không phải Google Sheet");
+    return clone(n.sheet);
+  };
+  FakeDrive.prototype.sheetsMeta = async function (id) { var d = await this.sheetsGet(id); return { sheets: d.sheets.map(function (s) { return { properties: s.properties }; }) }; };
+  FakeDrive.prototype.sheetsBatchUpdate = async function (id, requests) {
+    var doc = this.nodes[id].sheet;
+    requests.forEach(function (req) {
+      if (req.addSheet) {
+        var p = req.addSheet.properties;
+        doc.sheets.push({ properties: { sheetId: p.sheetId != null ? p.sheetId : doc.sheets.length, title: p.title || "Sheet", index: doc.sheets.length }, data: [{ startRow: 0, startColumn: 0, rowData: [] }] });
+      } else if (req.updateSheetProperties) {
+        var pp = req.updateSheetProperties.properties;
+        doc.sheets.forEach(function (s) { if (s.properties.sheetId === pp.sheetId && pp.title) s.properties.title = pp.title; });
+      } else if (req.updateCells) applyUpdateCells(doc, req.updateCells);
+    });
+    this.nodes[id].quotaBytesUsed = String(Math.max(1, JSON.stringify(doc).length));
+  };
+  function refreshHyperlink(cell) {        // Sheets thật tự tính lại trường "hyperlink" (chỉ đọc) sau mỗi lần ghi
+    var uri = null;
+    (cell.textFormatRuns || []).some(function (r) { var u = ((r.format || {}).link || {}).uri; if (u) { uri = u; return true; } return false; });
+    if (!uri) uri = ((((cell.userEnteredFormat || {}).textFormat) || {}).link || {}).uri;
+    if (!uri) { var m = /HYPERLINK\(\s*"([^"]+)"/i.exec(((cell.userEnteredValue || {}).formulaValue) || ""); if (m) uri = m[1]; }
+    if (uri) cell.hyperlink = uri; else delete cell.hyperlink;
+  }
+  function applyUpdateCells(doc, req) {
+    var start = req.start, sheet = doc.sheets.filter(function (s) { return s.properties.sheetId === start.sheetId; })[0];
+    if (!sheet) throw new Error("sheetId không tồn tại");
+    var rows = sheet.data[0].rowData = sheet.data[0].rowData || [];
+    var fields = String(req.fields || "*").split(",").map(function (f) { return f.trim(); });
+    (req.rows || []).forEach(function (rw, dr) {
+      var r = (start.rowIndex || 0) + dr;
+      while (rows.length <= r) rows.push({ values: [] });
+      var values = rows[r].values = rows[r].values || [];
+      (rw.values || []).forEach(function (cell, dc) {
+        var c = (start.columnIndex || 0) + dc;
+        while (values.length <= c) values.push({});
+        if (fields.indexOf("*") >= 0) values[c] = clone(cell);
+        else fields.forEach(function (f) {
+          var head = f.split(".")[0];
+          if (cell[head] !== undefined) values[c][head] = clone(cell[head]);
+          else if (head === "textFormatRuns") delete values[c].textFormatRuns;
+        });
+        refreshHyperlink(values[c]);
+      });
+    });
+  }
+  function blankSheet(title) { return { spreadsheetId: "", properties: { title: title }, sheets: [{ properties: { sheetId: 0, title: "Sheet1", index: 0 }, data: [{ startRow: 0, startColumn: 0, rowData: [] }] }] }; }
+
+  /** Bộ thư mục mẫu "Game Design" (giống ảnh chụp thật) + các ca khó: tên có "/", Google Form, shortcut, file nhị phân,
+   *  thư mục lồng 3 tầng, master sheet với 3 kiểu link (rich-text / công thức HYPERLINK / link cả ô), link ra ngoài. */
+  var DEMO_TREE = [
+    ["TSM_ Level Special", ["Level Special Design.xlsx", "Special Level List.xlsx", "mockup.png"]], ["TSM_ Piggy Bank", ["Piggy Bank GDD.xlsx"]],
+    ["TSM_ Hint", ["Hint Logic.xlsx"]], ["TSM_ LeaderBoard", ["LeaderBoard GDD.xlsx", "Reward Table.xlsx"]], ["TSM_ Gift Code", ["Gift Code Spec.xlsx"]],
+    ["TSM_ AB Test", ["AB Test Plan.xlsx", "AB Result Template.xlsx"]], ["TSM_ Segment ROAS/BLD", ["Segment Definition.xlsx"]], ["TSM_ Combo", ["Combo Rule.xlsx"]],
+    ["TSM_ Game Balancing", ["Logic Gameplay.xlsx", "Data Level.xlsx", "Element in Level.xlsx", "Lives.xlsx"]], ["TSM_ Win Streak", ["Win Streak.xlsx"]],
+    ["TSM_ Booster", ["Booster.xlsx", "Helper.xlsx", "Play On.xlsx", "More Lives.xlsx"]], ["TSM_ Compare Foodie Sizzle", ["Compare Note.gdoc"]],
+    ["TSM_ Improvement", ["Improvement Backlog.xlsx", "Feedback Form.gform"]], ["TSM_Remote Config", ["Remote config.xlsx"]], ["TSM_Shipper", ["Shipper.xlsx", "Flow Game.gdoc"]],
+    ["TSM_ Tutorial", ["Tutorial.xlsx", "Ads Position.xlsx"]], ["TSM_ IAP", ["Shop IAP IOS.xlsx", "Shop IAP Andr.xlsx"]],
+    ["TSM_ Misc", ["List AnimVfx.xlsx", "Soundfx & Vibrate.xlsx", "Event tracking.xlsx", "tsm_icon.png", "Tsm_Notes.gdoc"]],
+  ];
+  var DEMO_LAYOUT = [
+    ["Game Play", [["Logic Gameplay", "TSM_ Game Balancing/Logic Gameplay.xlsx"], ["Tutorial", "TSM_ Tutorial/Tutorial.xlsx"], ["Ads Position", "TSM_ Tutorial/Ads Position.xlsx"], ["Flow Game", "TSM_Shipper/Flow Game.gdoc"]]],
+    ["CORE MECHANICS", [["Data Level", "TSM_ Game Balancing/Data Level.xlsx"], ["Element in Level", "TSM_ Game Balancing/Element in Level.xlsx"], ["Lives", "TSM_ Game Balancing/Lives.xlsx"], ["Booster", "TSM_ Booster/Booster.xlsx"]]],
+    ["SUB MECHANICS", [["Helper", "TSM_ Booster/Helper.xlsx"], ["Play On", "TSM_ Booster/Play On.xlsx"], ["More Lives", "TSM_ Booster/More Lives.xlsx"], ["Shipper", "TSM_Shipper/Shipper.xlsx"], ["Win Streak", "TSM_ Win Streak/Win Streak.xlsx"]]],
+    ["IAP", [["Shop IAP IOS", "TSM_ IAP/Shop IAP IOS.xlsx"], ["Shop IAP Andr", "TSM_ IAP/Shop IAP Andr.xlsx"]]],
+    ["MISCELLANEOUS", [["List AnimVfx", "TSM_ Misc/List AnimVfx.xlsx"], ["Soundfx & Vibrate", "TSM_ Misc/Soundfx & Vibrate.xlsx"], ["Event tracking", "TSM_ Misc/Event tracking.xlsx"], ["Remote config", "TSM_Remote Config/Remote config.xlsx"]]],
+  ];
+  var FOREIGN_ID = "1aBcDeFgHiJkLmNoPqRsTuVwXyZ012345";
+  var EXT_MIME = { ".xlsx": XLSX_MIME, ".gdoc": DOC_MIME, ".gsheet": SHEET_MIME, ".gform": FORM_MIME, ".png": "image/png" };
+  function mimeAndName(f) {
+    for (var ext in EXT_MIME) if (f.slice(-ext.length) === ext) return [isGoogle(EXT_MIME[ext]) ? f.slice(0, -ext.length) : f, EXT_MIME[ext]];
+    return [f, "application/octet-stream"];
+  }
+  function linkCell(label, url, style) {
+    if (style === 0) return { userEnteredValue: { stringValue: label }, textFormatRuns: [{ startIndex: 0, format: { link: { uri: url } } }], hyperlink: url };
+    if (style === 1) return { userEnteredValue: { formulaValue: '=HYPERLINK("' + url + '","' + label + '")' }, formattedValue: label };
+    return { userEnteredValue: { stringValue: label }, userEnteredFormat: { textFormat: { link: { uri: url } } }, hyperlink: url };
+  }
+  /** Trả {drive, source, dest}. */
+  function demoSeed(seed) {
+    var fd = new FakeDrive(seed || 7);
+    var my = fd._add("My Drive", FOLDER_MIME, "");
+    var src = fd._add("Game Design", FOLDER_MIME, my), dest = fd._add("Dich thu nghiem", FOLDER_MIME, my);
+    var byPath = {};
+    DEMO_TREE.forEach(function (t) {
+      var fid = fd._add(t[0], FOLDER_MIME, src); byPath[t[0]] = fid;
+      t[1].forEach(function (f) {
+        var mn = mimeAndName(f), nid = fd._add(mn[0], mn[1], fid, { blob: new Array(21).join("noi dung that ") });
+        fd.nodes[nid].quotaBytesUsed = "280"; byPath[t[0] + "/" + f] = nid;
+      });
+      if (t[0] === "TSM_ AB Test") {
+        var sid = fd._add("Archive", FOLDER_MIME, fid);
+        ["AB_2025 raw.xlsx", "AB_2024 raw.xlsx"].forEach(function (f) { var nid = fd._add(f, XLSX_MIME, sid, { blob: new Array(51).join("raw") }); fd.nodes[nid].quotaBytesUsed = "150"; });
+      }
+    });
+    fd._add("Link nhanh - Data Level", SHORTCUT_MIME, src, { shortcutDetails: { targetId: byPath["TSM_ Game Balancing/Data Level.xlsx"] } });
+    var master = fd._add("TSM_ Master Sheet", SHEET_MIME, src);
+    fd.nodes[master].quotaBytesUsed = "8400";
+    var rows = [];
+    DEMO_LAYOUT.forEach(function (sec, idx) {
+      rows.push({ values: [{ userEnteredValue: { stringValue: sec[0] } }] });
+      var cells = [{}];
+      sec[1].forEach(function (l, i) {
+        var path = l[1], target = byPath[path], mime = EXT_MIME["." + path.split(".").pop()] || XLSX_MIME;
+        cells.push(linkCell(l[0], viewUrl(target, mime), (i + idx) % 3));
+      });
+      rows.push({ values: cells });
+    });
+    rows.push({ values: [{ userEnteredValue: { stringValue: "Tham khao" } }, linkCell("Tai lieu ben ngoai", "https://docs.google.com/document/d/" + FOREIGN_ID + "/edit", 0),
+      linkCell("Google Play", "https://play.google.com/store/apps/details", 1)] });
+    fd.nodes[master].sheet = { spreadsheetId: master, properties: { title: "TSM_ Master Sheet" }, sheets: [{ properties: { sheetId: 0, title: "Master", index: 0 }, data: [{ startRow: 0, startColumn: 0, rowData: rows }] }] };
+    return { drive: fd, source: src, dest: dest };
+  }
+
+  return {
+    FOLDER_MIME: FOLDER_MIME, SHORTCUT_MIME: SHORTCUT_MIME, SHEET_MIME: SHEET_MIME, DOC_MIME: DOC_MIME, XLSX_MIME: XLSX_MIME, GOOGLE_PREFIX: GOOGLE_PREFIX,
+    MY_DRIVE: MY_DRIVE, PROP_SRC: PROP_SRC, LOG_PREFIX: LOG_PREFIX, INDEX_TITLE: INDEX_TITLE, DEFAULT_MASTER_PATTERN: DEFAULT_MASTER_PATTERN, FOREIGN_ID: FOREIGN_ID,
+    STATUS_LABEL: STATUS_LABEL, HEADERS: HEADERS, KEYS: KEYS, COUNT_LABELS: COUNT_LABELS,
+    parseId: parseId, viewUrl: viewUrl, showPath: showPath, mapLimit: mapLimit, matchCase: matchCase, rename: rename, ruleProblems: ruleProblems,
+    scan: scan, buildPlan: buildPlan, execute: execute, remapText: remapText, remapCell: remapCell, remapSheet: remapSheet, remapTargets: remapTargets,
+    remapAll: remapAll, buildIndexTab: buildIndexTab, verify: verify, summarize: summarize, toCsv: toCsv, summaryRows: summaryRows,
+    sheetTitle: sheetTitle, writeSheet: writeSheet, run: run, FakeDrive: FakeDrive, demoSeed: demoSeed,
+  };
+})();
+if (typeof module === "object" && module.exports) module.exports = DC;
+</script>

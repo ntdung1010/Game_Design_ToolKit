@@ -1,0 +1,9 @@
+data/
+out/
+__pycache__/
+*.pyc
+.venv/
+
+# bộ Apps Script tải từ trang Drive Clone — bản gốc ở tools/drive_clone/appsscript/
+DriveClone_AppsScript/
+DriveClone_AppsScript*.zip

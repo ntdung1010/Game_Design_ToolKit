@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gd-toolkit",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["server.py", "--no-open"],
+      "port": 7700
+    },
+    {
+      "name": "gd-toolkit-test",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["server.py", "--no-open", "--port", "7701", "--data-dir", "C:/Users/IEC-WW/AppData/Local/Temp/gdk-test-3d"],
+      "port": 7701
+    }
+  ]
+}

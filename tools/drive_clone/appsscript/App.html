@@ -1,0 +1,470 @@
+<script>
+/* Drive Clone — giao diện web app. Logic nằm ở Pipeline.html (DC); file này chỉ vẽ form, gọi DC.run và hiện kết quả.
+   Chạy trong Apps Script: backend = google.script.run (Drive của chính người mở trang).
+   Mở file ngoài Apps Script (xem thử): chỉ có chế độ Demo. */
+(function () {
+  "use strict";
+  var MASTER_PATTERN = DC.DEFAULT_MASTER_PATTERN;
+  var STATUS_VI = { CREATED: "Tạo thư mục", MERGED: "Gộp thư mục", COPIED: "Copy đầy đủ", SKELETON: "Vỏ rỗng", SHORTCUT: "Shortcut", EXISTS: "Đã có — giữ nguyên", SKIPPED: "Bỏ qua", ERROR: "Lỗi" };
+  var STAGE_VI = { scan: "Đang quét thư mục A", clone: "Đang tạo bản sao", remap: "Đang đổi link", index: "Đang tạo mục lục", verify: "Đang hậu kiểm", log: "Đang ghi Change Log lên Drive", done: "Xong" };
+  var HAS_GAS = typeof google !== "undefined" && google.script && google.script.run;
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+  var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
+  var store = {
+    get: function (k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
+    set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* trình duyệt chặn lưu → bỏ qua */ } },
+  };
+  var fmtBytes = function (n) { n = +n || 0; return n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : n < 1073741824 ? (n / 1048576).toFixed(1) + " MB" : (n / 1073741824).toFixed(2) + " GB"; };
+  var toastT;
+  function toast(msg, kind) {
+    var t = $(".toast") || document.body.appendChild(document.createElement("div"));
+    t.className = "toast " + (kind || ""); t.textContent = msg;
+    clearTimeout(toastT); toastT = setTimeout(function () { t.remove(); }, 4200);
+  }
+  function download(name, text, mime) {
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: mime || "text/csv;charset=utf-8" }));
+    a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  // ------------------------------------------------------------------ backend Google (google.script.run → Code.gs)
+  function gas(fn) {
+    return function () {
+      var args = Array.prototype.slice.call(arguments);
+      return new Promise(function (ok, fail) {
+        var r = google.script.run.withSuccessHandler(ok).withFailureHandler(function (e) { fail(new Error((e && e.message) || String(e))); });
+        r[fn].apply(r, args);
+      });
+    };
+  }
+  var GasBackend = {};
+  ["whoami", "getFile", "listChildren", "createFolder", "createEmpty", "createShortcut", "copyFile", "exportText", "sheetsGet", "sheetsMeta",
+    "sheetsBatchUpdate", "xlsxRemap", "xlsxLinks"].forEach(function (f) { GasBackend[f] = HAS_GAS ? gas(f) : function () { return Promise.reject(new Error("Chỉ chạy được trong Apps Script.")); }; });
+
+  var defaults = function () {
+    return { src: "", dest: "", wrap_root: false, new_root_name: "", content_mode: "full", rules: [{ from: "", to: "", ignore_case: true, regex: false }],
+      skip_existing: true, write_log_sheet: true, remap_links: "masters", build_index: false, auto_master: true, master_pattern: MASTER_PATTERN,
+      binary_mode: "skeleton", uncreatable_mode: "placeholder_doc", shortcut_mode: "retarget", workers: 4 };
+  };
+  var S = { mode: null, backend: null, account: {}, demo: null, form: defaults(), manifest: null, plan: null, itemModes: {}, collapsed: {},
+    treeFilter: "all", treeQ: "", running: null, stop: false, logs: [], prog: { done: 0, total: 0, stage: "" }, detail: null, tab: "log",
+    logFilter: "all", logQ: "", history: store.get("dc.history", []) };
+  var formKey = function () { return "dc.form." + (S.mode || "real"); };
+  var saveForm = function () { store.set(formKey(), S.form); };
+
+  document.getElementById("app").innerHTML = layout();
+  var el = function (s) { return $(s, document.getElementById("app")); };
+
+  function layout() {
+    return '' +
+    '<section class="panel"><div class="ph"><span class="step">1</span><h2>Thư mục nguồn (A) và đích (B)</h2></div><div class="pb">' +
+      '<div class="row"><div class="f"><label class="lb">Link thư mục A — nguồn cần clone *</label><input type="text" id="src" placeholder="https://drive.google.com/drive/folders/…"></div>' +
+      '<button class="btn primary" id="btnScan">Quét A</button></div><div id="scanInfo"></div>' +
+      '<div class="row" style="margin-top:14px"><div class="f"><label class="lb">Thư mục B — nơi đặt bản sao <span class="faint">(để trống = tạo thư mục mới trong My Drive)</span></label>' +
+      '<input type="text" id="dest" placeholder="Để trống = My Drive của bạn · hoặc link thư mục kết quả của lần clone trước"></div></div>' +
+      '<p class="hint">🔒 Tool chỉ <b>đọc</b> thư mục A và <b>tạo mới</b> trong B — không sửa, không xoá file có sẵn nào. B dán được bất kỳ thư mục nào tài khoản của bạn có quyền sửa (Editor).</p>' +
+      '<div style="margin-top:10px"><label class="radio-line"><input type="radio" name="wrap" value="0"><span>Đổ <b>nội dung</b> của A vào thẳng B</span></label>' +
+      '<label class="radio-line"><input type="radio" name="wrap" value="1"><span>Tạo một thư mục mới trong B, tên:</span></label>' +
+      '<div style="padding-left:26px;max-width:460px"><input type="text" id="rootName" placeholder="để trống = tên A sau khi đổi tên"></div></div>' +
+      '<div class="pathline" id="pathPreview"></div></div></section>' +
+    '<section class="panel"><div class="ph"><span class="step">2</span><h2>Kiểu clone</h2></div><div class="pb"><div class="choice" id="modeChoice">' +
+      '<button data-c="full"><b>Copy toàn bộ dữ liệu</b><span class="d">Mọi file được copy nguyên nội dung, giữ cấu trúc thư mục.</span><span class="ex">VD: Game Design BSHP → PRSP</span></button>' +
+      '<button data-c="skeleton"><b>Chỉ dựng khung</b><span class="d">Giữ cây thư mục + tên file nhưng file là vỏ rỗng; master sheet copy đầy đủ và đổi link sang cây mới.</span><span class="ex">VD: mở project mới theo bố cục TSM_ → GWP_</span></button>' +
+    '</div></div></section>' +
+    '<section class="panel"><div class="ph"><span class="step">3</span><h2>Đổi tên thư mục &amp; file</h2><span class="sub">áp cho mọi cấp</span><div class="right"><span class="badge" id="renameCount" hidden></span></div></div><div class="pb">' +
+      '<div id="rules"></div><div class="row" style="align-items:center"><button class="btn sm" id="addRule">+ Thêm quy tắc</button>' +
+      '<span class="hint" style="margin:0"><span class="mono">Aa</span> = không phân biệt hoa thường &amp; giữ kiểu chữ (bshp → prsp, Bshp → Prsp) · <span class="mono">.*</span> = regex</span></div>' +
+      '<p class="hint">Chỉ đổi <b>tên</b>. Chữ bên trong nội dung Docs/Sheets giữ nguyên.</p></div></section>' +
+    '<section class="panel"><div class="ph"><span class="step">4</span><h2>Tuỳ chọn</h2></div><div class="pb"><div class="cols2">' +
+      '<label class="check"><input type="checkbox" id="o_skip_existing"><span>Trùng tên ở B thì gộp thư mục, giữ nguyên file đã có<small>Chạy lại để tiếp tục khi bị ngắt — không tạo bản trùng, không ghi đè file của B.</small></span></label>' +
+      '<label class="check"><input type="checkbox" id="o_write_log_sheet"><span>Ghi Change Log thành Google Sheet trong B<small>Tab Summary + Change Log. Tải thêm được bản CSV.</small></span></label>' +
+      '<div><label class="lb">Đổi link trong file được copy sang cây mới</label><select id="o_remap_links"><option value="off">Tắt</option><option value="masters">Chỉ master sheet (khuyên dùng)</option><option value="all">Mọi Google Sheet / .xlsx được copy (chậm hơn)</option></select></div>' +
+      '<label class="check"><input type="checkbox" id="o_build_index"><span>Thêm tab <span class="mono">_INDEX_AUTO</span> vào master sheet<small>Mục lục link toàn bộ cây mới — lưới an toàn nếu có link không đổi được.</small></span></label>' +
+    '</div><details style="margin-top:10px"><summary class="dim" style="cursor:pointer">Nâng cao</summary><div class="cols2" style="margin-top:10px">' +
+      '<div><label class="check"><input type="checkbox" id="o_auto_master"><span>Tự nhận master sheet — Sheet/xlsx ở gốc A hoặc tên khớp:</span></label><input type="text" id="o_master_pattern" class="mono"></div>' +
+      '<div><label class="lb">Số việc chạy song song</label><select id="o_workers"><option value="1">1 — tuần tự</option><option value="2">2</option><option value="4">4 — khuyên dùng</option><option value="6">6</option><option value="8">8 — dễ bị Google giới hạn</option></select></div>' +
+      '<div><label class="lb">Shortcut có sẵn trong A</label><select id="o_shortcut_mode"><option value="retarget">Tạo lại, trỏ sang bản mới nếu có</option><option value="skip">Bỏ qua</option></select></div>' +
+      '<div data-only="skeleton"><label class="lb">(Dựng khung) File nhị phân .xlsx .png .pdf…</label><select id="o_binary_mode"><option value="skeleton">Tạo vỏ rỗng cùng tên</option><option value="skip">Bỏ qua</option></select></div>' +
+      '<div data-only="skeleton"><label class="lb">(Dựng khung) Form / Script — Google không cho tạo rỗng</label><select id="o_uncreatable_mode"><option value="placeholder_doc">Thay bằng Doc rỗng cùng tên</option><option value="shortcut">Shortcut về bản gốc</option><option value="skip">Bỏ qua</option></select></div>' +
+    '</div></details></div></section>' +
+    '<section class="panel"><div class="ph"><span class="step">5</span><h2>Xem trước cây thư mục</h2><span class="sub">chọn tay từng mục nếu cần</span>' +
+      '<div class="right"><button class="btn sm ghost" id="expandAll">Mở hết</button><button class="btn sm ghost" id="collapseAll">Thu gọn</button></div></div><div class="pb">' +
+      '<div class="toolbar"><div id="treeFilter"><button class="chip on" data-f="all">Tất cả</button> <button class="chip" data-f="renamed">Đổi tên</button> <button class="chip" data-f="master">Master / đổi link</button> <button class="chip" data-f="skip">Bỏ qua</button></div>' +
+      '<span class="grow"></span><input type="search" id="treeQ" placeholder="Lọc theo tên…"></div><div class="tree" id="tree"><div class="empty">Quét thư mục A để xem cây.</div></div></div></section>' +
+    '<div class="runbar"><div class="sum"><div id="planSum">Quét A để xem kế hoạch.</div><div class="warnbox" id="planWarn"></div><div id="progBox"></div></div>' +
+      '<button class="btn" id="btnDry">Chạy thử</button><button class="btn primary" id="btnRun">Clone thật</button><button class="btn danger" id="btnStop" hidden>Dừng</button></div>' +
+    '<section class="panel" id="pResult"><div class="ph"><h2>Kết quả</h2><span class="sub" id="resWhen"></span><div class="right" id="resLinks"></div></div>' +
+      '<div class="pb" id="resTop"><div class="empty">Chưa có lần chạy nào. Bấm <b>Chạy thử</b> để xem Change Log dự kiến mà không tạo gì.</div></div>' +
+      '<div class="tabs" id="resTabs" hidden><button data-t="log">Change Log <span class="n" id="nLog"></span></button><button data-t="verify">Hậu kiểm <span class="n" id="nVerify"></span></button><button data-t="console">Nhật ký</button></div>' +
+      '<div class="pb" id="resBody" hidden></div></section>' +
+    '<section class="panel"><div class="ph"><h2>Lịch sử chạy</h2><span class="sub">lưu trong trình duyệt này · bản đầy đủ là Change Log trên Drive</span></div><div class="pb" id="hist"></div></section>' +
+    '<footer>GD Toolkit · Drive Clone (Apps Script) · chạy bằng tài khoản Google của bạn — không có server trung gian</footer>';
+  }
+
+  // ------------------------------------------------------------------ nguồn dữ liệu
+  function setMode(m) {
+    if (S.running) return toast("Đang chạy — bấm Dừng trước.", "bad");
+    S.mode = m; S.manifest = null; S.plan = null; S.itemModes = {};
+    if (m === "demo") {
+      S.demo = DC.demoSeed(); S.backend = S.demo.drive; S.account = { emailAddress: "demo@local" };
+      var saved = store.get(formKey(), null);
+      S.form = Object.assign(defaults(), saved || { src: S.demo.source, dest: S.demo.dest, rules: [{ from: "TSM_", to: "PRSP_", ignore_case: true, regex: false }] });
+      S.form.src = S.demo.source; S.form.dest = S.demo.dest;          // id giả lập đổi mỗi lần tạo → luôn điền lại
+    } else {
+      S.backend = GasBackend;
+      S.form = Object.assign(defaults(), store.get(formKey(), {}));
+    }
+    renderWho(); bindForm(); renderAll();
+  }
+  function renderWho() {
+    $$("#modeSeg button").forEach(function (b) { b.classList.toggle("on", b.dataset.m === S.mode); b.disabled = b.dataset.m === "real" && !HAS_GAS; });
+    var who = $("#who");
+    if (S.mode === "demo") who.innerHTML = '<span class="badge warn">DEMO</span> Drive giả lập — không đụng dữ liệu thật';
+    else if (S.account.emailAddress) who.innerHTML = '<span class="badge ok">✓ ' + esc(S.account.emailAddress) + "</span>";
+    else who.innerHTML = '<span class="spin"></span> Đang kết nối Google…';
+  }
+  $("#modeSeg").onclick = function (e) { var b = e.target.closest("button"); if (b && b.dataset.m !== S.mode && !b.disabled) setMode(b.dataset.m); };
+
+  // ------------------------------------------------------------------ form
+  function bindForm() {
+    var f = S.form;
+    el("#src").value = f.src; el("#dest").value = f.dest; el("#rootName").value = f.new_root_name;
+    syncWrap();
+    ["skip_existing", "write_log_sheet", "build_index", "auto_master"].forEach(function (k) { el("#o_" + k).checked = !!f[k]; });
+    ["remap_links", "master_pattern", "shortcut_mode", "binary_mode", "uncreatable_mode", "workers"].forEach(function (k) { el("#o_" + k).value = f[k]; });
+    renderModeChoice(); renderRules();
+  }
+  function syncWrap() {           // B để trống = My Drive → luôn tạo thư mục mới (không đổ thẳng vào My Drive)
+    var my = !S.form.dest;
+    if (my) S.form.wrap_root = true;
+    $$('input[name="wrap"]').forEach(function (r) { r.checked = (r.value === "1") === !!S.form.wrap_root; if (r.value === "0") r.disabled = my; });
+    el("#rootName").disabled = !S.form.wrap_root;
+  }
+  function changed() { saveForm(); replan(); }
+  el("#src").oninput = function (e) { S.form.src = e.target.value.trim(); saveForm(); };
+  el("#dest").oninput = function (e) { S.form.dest = e.target.value.trim(); syncWrap(); changed(); };
+  el("#rootName").oninput = function (e) { S.form.new_root_name = e.target.value; changed(); };
+  $$('input[name="wrap"]').forEach(function (r) { r.onchange = function () { S.form.wrap_root = r.value === "1"; el("#rootName").disabled = !S.form.wrap_root; changed(); }; });
+  ["skip_existing", "write_log_sheet", "build_index", "auto_master"].forEach(function (k) { el("#o_" + k).onchange = function (e) { S.form[k] = e.target.checked; changed(); }; });
+  ["remap_links", "shortcut_mode", "binary_mode", "uncreatable_mode"].forEach(function (k) { el("#o_" + k).onchange = function (e) { S.form[k] = e.target.value; changed(); }; });
+  el("#o_workers").onchange = function (e) { S.form.workers = +e.target.value; saveForm(); };
+  el("#o_master_pattern").oninput = function (e) { S.form.master_pattern = e.target.value; changed(); };
+  el("#modeChoice").onclick = function (e) {
+    var b = e.target.closest("button"); if (!b || b.dataset.c === S.form.content_mode) return;
+    S.form.content_mode = b.dataset.c; S.form.build_index = b.dataset.c === "skeleton"; el("#o_build_index").checked = S.form.build_index;
+    renderModeChoice(); changed();
+  };
+  function renderModeChoice() {
+    $$("#modeChoice button").forEach(function (b) { b.classList.toggle("on", b.dataset.c === S.form.content_mode); });
+    $$("[data-only]").forEach(function (x) { x.hidden = x.dataset.only !== S.form.content_mode; });
+  }
+  function renderRules() {
+    el("#rules").innerHTML = S.form.rules.map(function (r, i) {
+      return '<div class="rule" data-i="' + i + '"><input type="text" data-k="from" placeholder="chuỗi cũ — vd BSHP" value="' + esc(r.from) + '"><span class="arrow dim">→</span>' +
+        '<input type="text" data-k="to" placeholder="chuỗi mới — vd PRSP" value="' + esc(r.to) + '">' +
+        '<button class="tog ' + (r.ignore_case ? "on" : "") + '" data-t="ignore_case" title="Không phân biệt hoa thường + giữ kiểu chữ">Aa</button>' +
+        '<button class="tog ' + (r.regex ? "on" : "") + '" data-t="regex" title="Biểu thức chính quy (regex)">.*</button>' +
+        '<button class="btn ghost sm" data-del title="Xoá quy tắc">✕</button></div>';
+    }).join("");
+  }
+  el("#rules").oninput = function (e) { var row = e.target.closest(".rule"); if (!row) return; S.form.rules[+row.dataset.i][e.target.dataset.k] = e.target.value; changed(); };
+  el("#rules").onclick = function (e) {
+    var row = e.target.closest(".rule"); if (!row) return;
+    var i = +row.dataset.i, t = e.target.closest("[data-t]");
+    if (t) { S.form.rules[i][t.dataset.t] = !S.form.rules[i][t.dataset.t]; t.classList.toggle("on"); changed(); }
+    else if (e.target.closest("[data-del]")) {
+      S.form.rules.splice(i, 1);
+      if (!S.form.rules.length) S.form.rules.push({ from: "", to: "", ignore_case: true, regex: false });
+      renderRules(); changed();
+    }
+  };
+  el("#addRule").onclick = function () { S.form.rules.push({ from: "", to: "", ignore_case: true, regex: false }); renderRules(); };
+  function options(extra) {
+    var f = S.form;
+    return Object.assign({ dest_parent: f.dest, content_mode: f.content_mode, wrap_root: !!f.wrap_root, new_root_name: f.new_root_name,
+      rename_rules: f.rules.filter(function (r) { return r.from; }), item_modes: S.itemModes, skip_existing: f.skip_existing, write_log_sheet: f.write_log_sheet,
+      remap_links: f.remap_links, build_index: f.build_index, auto_master: f.auto_master, master_pattern: f.master_pattern, binary_mode: f.binary_mode,
+      uncreatable_mode: f.uncreatable_mode, shortcut_mode: f.shortcut_mode, workers: f.workers || 4 }, extra || {});
+  }
+  function renderPath() {
+    var a = S.manifest ? S.manifest.root.name : "A", root = S.plan && S.plan.wrap_root ? S.plan.new_root_name : "", B = S.form.dest ? "B" : "My Drive";
+    el("#pathPreview").innerHTML = S.form.wrap_root
+      ? "Bản sao: <b>" + B + "</b> / <b>" + esc(root || S.form.new_root_name || "(tên A sau khi đổi)") + '</b> / <span class="faint">…nội dung của “' + esc(a) + "”</span>"
+      : "Bản sao: <b>" + B + '</b> / <span class="faint">…nội dung của “' + esc(a) + "” (không tạo thư mục bọc ngoài)</span>";
+  }
+
+  // ------------------------------------------------------------------ quét + kế hoạch (kế hoạch tính ngay trên trình duyệt)
+  function log(msg, level) {
+    var d = new Date(), z = function (n) { return (n < 10 ? "0" : "") + n; };
+    S.logs.push({ t: z(d.getHours()) + ":" + z(d.getMinutes()) + ":" + z(d.getSeconds()), msg: msg, level: level || "info" });
+    if (S.tab === "console" && !el("#resBody").hidden) renderBody();
+  }
+  el("#btnScan").onclick = async function () {
+    if (!S.backend) return toast("Chưa kết nối Google — chờ một chút hoặc chọn Demo.", "bad");
+    if (!S.form.src) return toast("Dán link thư mục A trước.", "bad");
+    var id = DC.parseId(S.form.src);
+    S.running = "scan"; S.stop = false; S.logs = []; syncButtons();
+    el("#scanInfo").innerHTML = '<p class="hint"><span class="spin"></span>&nbsp; Đang quét…</p>';
+    try {
+      S.manifest = await DC.scan(S.backend, id, { log: function (m) { log(m); el("#scanInfo").innerHTML = '<p class="hint"><span class="spin"></span>&nbsp; ' + esc(m) + "</p>"; },
+        shouldStop: function () { return S.stop; }, workers: S.form.workers });
+      S.itemModes = {}; S.collapsed = {};
+      if (S.manifest.items.length > 300) S.manifest.items.forEach(function (i) { if (i.kind === "folder") S.collapsed[i.id] = 1; });
+      toast("Quét xong: " + S.manifest.stats.folders + " thư mục, " + S.manifest.stats.files + " file.", "ok");
+    } catch (e) {
+      S.manifest = null;
+      el("#scanInfo").innerHTML = '<div class="note bad">⚠ ' + esc(e.message) + "</div>";
+      S.running = null; syncButtons(); return;
+    }
+    S.running = null; renderScanInfo(); replan(); syncButtons();
+  };
+  function renderScanInfo() {
+    var m = S.manifest;
+    el("#scanInfo").innerHTML = !m ? "" : '<div class="stats"><div class="stat acc"><b>' + m.stats.folders + '</b><span>thư mục</span></div><div class="stat acc"><b>' + m.stats.files +
+      '</b><span>file</span></div><div class="stat"><b>' + m.stats.depth + '</b><span>tầng sâu nhất</span></div><div class="stat"><b>' + fmtBytes(m.stats.bytes) +
+      '</b><span>dung lượng (file thường)</span></div></div><p class="hint">Đã quét: <a href="' + esc(m.root.url) + '" target="_blank" rel="noopener">' + esc(m.root.name) + "</a></p>";
+  }
+  function replan() {
+    renderPath();
+    if (!S.manifest) { S.plan = null; renderPlan(); return; }
+    try { S.plan = DC.buildPlan(S.manifest, options()); } catch (e) { S.plan = null; el("#planWarn").textContent = e.message; }
+    renderPlan();
+  }
+  function renderPlan() {
+    var p = S.plan;
+    renderPath(); renderTree();
+    if (!p) { el("#planSum").textContent = "Quét A để xem kế hoạch."; el("#planWarn").innerHTML = ""; el("#renameCount").hidden = true; return; }
+    var s = p.stats, parts = ["<b>" + s.folders + "</b> thư mục"];
+    if (s.copy) parts.push("copy <b>" + s.copy + "</b> file (" + fmtBytes(s.bytes_copy) + ")");
+    if (s.skeleton) parts.push("<b>" + s.skeleton + "</b> vỏ rỗng");
+    if (s.shortcut) parts.push("<b>" + s.shortcut + "</b> shortcut");
+    parts.push("đổi tên <b>" + s.renamed + "</b>");
+    if (s.remap) parts.push("đổi link <b>" + s.remap + "</b> file");
+    if (s.skip) parts.push("bỏ qua <b>" + s.skip + "</b>");
+    el("#planSum").innerHTML = "Kế hoạch: " + parts.join(" · ");
+    el("#planWarn").innerHTML = p.warnings.map(function (w) { return "<div>⚠ " + esc(w) + "</div>"; }).join("");
+    var rc = el("#renameCount"); rc.hidden = false; rc.textContent = s.renamed + " mục sẽ đổi tên";
+  }
+
+  // ------------------------------------------------------------------ cây
+  var LOCKED = ["nằm trong thư mục bị loại trừ", "đây là thư mục ĐÍCH"];
+  function fileIcon(it) { return it.kind === "folder" ? "📁" : it.kind === "shortcut" ? "↗" : /spreadsheet|sheet/.test(it.mime) ? "▦" : /document|word|pdf|text/.test(it.mime) ? "📄" : /image/.test(it.mime) ? "🖼" : "•"; }
+  function nodeHtml(it, op, depth, hasKids, flat) {
+    var kind = op ? op.kind : it.kind === "folder" ? "folder" : "copy";
+    var locked = op && LOCKED.some(function (x) { return (op.note || "").indexOf(x) === 0; });
+    var choices = it.kind === "folder" ? [["folder", "Clone"], ["skip", "Bỏ qua cả thư mục"]] : it.kind === "shortcut" ? [["shortcut", "Shortcut"], ["skip", "Bỏ qua"]]
+      : [["copy", "Copy đầy đủ"], ["skeleton", "Vỏ rỗng"], ["skip", "Bỏ qua"]];
+    var val = locked ? "skip" : kind;
+    var sel = '<select data-sel="' + esc(it.id) + '" ' + (locked ? "disabled" : "") + ' title="' + esc(op ? op.note || "" : "") + '">' +
+      choices.map(function (c) { return '<option value="' + c[0] + '" ' + (c[0] === val ? "selected" : "") + ">" + c[1] + "</option>"; }).join("") + "</select>";
+    var tw = hasKids ? '<button class="tw" data-tw="' + esc(it.id) + '">' + (S.collapsed[it.id] ? "▸" : "▾") + "</button>" : '<span class="tw none"></span>';
+    return '<div class="node ' + (kind === "skip" ? "skip" : "") + '" style="padding-left:' + (10 + depth * 18) + 'px">' + tw + '<span class="ic">' + fileIcon(it) + "</span>" +
+      '<span class="nm" title="' + esc(it.parts.join(" / ")) + '">' + (flat ? '<span class="faint">' + esc(it.parent_parts.join(" / ")) + (it.parent_parts.length ? " / " : "") + "</span>" : "") + esc(it.name) + "</span>" +
+      (op && op.renamed ? '<span class="new">→ ' + esc(op.dst_name) + "</span>" : "") + '<span class="sp"></span>' +
+      (op && op.master ? '<span class="mini">master</span>' : "") + (op && op.remap ? '<span class="mini l">đổi link</span>' : "") +
+      (it.kind === "file" && it.bytes ? '<span class="sz">' + fmtBytes(it.bytes) + "</span>" : "") + sel + "</div>";
+  }
+  function renderTree() {
+    var m = S.manifest;
+    if (!m) { el("#tree").innerHTML = '<div class="empty">Quét thư mục A để xem cây.</div>'; return; }
+    if (!m.items.length) { el("#tree").innerHTML = '<div class="empty">Thư mục A đang rỗng.</div>'; return; }
+    var ops = {}; if (S.plan) S.plan.ops.forEach(function (o) { ops[o.src_id] = o; });
+    var q = S.treeQ.trim().toLowerCase(), f = S.treeFilter, out = [];
+    if (f !== "all" || q) {
+      var match = m.items.filter(function (it) {
+        var op = ops[it.id];
+        if (q && !(it.name.toLowerCase().indexOf(q) >= 0 || (op && op.dst_name.toLowerCase().indexOf(q) >= 0))) return false;
+        if (f === "renamed") return op && op.renamed;
+        if (f === "master") return op && (op.master || op.remap);
+        if (f === "skip") return op && op.kind === "skip";
+        return true;
+      });
+      match.slice(0, 2000).forEach(function (it) { out.push(nodeHtml(it, ops[it.id], 0, false, true)); });
+      if (!match.length) out.push('<div class="empty">Không có mục nào khớp.</div>');
+    } else {
+      var kids = {};
+      m.items.forEach(function (it) { var k = JSON.stringify(it.parent_parts); (kids[k] = kids[k] || []).push(it); });
+      (function walk(parts, depth) {
+        (kids[JSON.stringify(parts)] || []).slice().sort(function (a, b) { return a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "folder" ? -1 : b.kind === "folder" ? 1 : 0; })
+          .forEach(function (it) {
+            var has = it.kind === "folder" && (kids[JSON.stringify(it.parts)] || []).length > 0;
+            out.push(nodeHtml(it, ops[it.id], depth, has, false));
+            if (has && !S.collapsed[it.id] && out.length < 6000) walk(it.parts, depth + 1);
+          });
+      })([], 0);
+    }
+    el("#tree").innerHTML = out.join("");
+  }
+  el("#tree").onclick = function (e) { var t = e.target.closest("[data-tw]"); if (!t) return; var id = t.dataset.tw; if (S.collapsed[id]) delete S.collapsed[id]; else S.collapsed[id] = 1; renderTree(); };
+  el("#tree").onchange = function (e) {
+    var s = e.target.closest("[data-sel]"); if (!s) return;
+    if (s.value === "folder" || s.value === "shortcut") delete S.itemModes[s.dataset.sel]; else S.itemModes[s.dataset.sel] = s.value;
+    replan();
+  };
+  el("#treeFilter").onclick = function (e) { var b = e.target.closest(".chip"); if (!b) return; S.treeFilter = b.dataset.f; $$("#treeFilter .chip").forEach(function (x) { x.classList.toggle("on", x === b); }); renderTree(); };
+  el("#treeQ").oninput = function (e) { S.treeQ = e.target.value; renderTree(); };
+  el("#expandAll").onclick = function () { S.collapsed = {}; renderTree(); };
+  el("#collapseAll").onclick = function () { if (S.manifest) S.manifest.items.forEach(function (i) { if (i.kind === "folder") S.collapsed[i.id] = 1; }); renderTree(); };
+
+  // ------------------------------------------------------------------ chạy
+  function syncButtons() {
+    var b = !!S.running;
+    el("#btnScan").disabled = b || !S.backend;
+    el("#btnDry").disabled = b || !S.manifest;
+    el("#btnRun").disabled = b || !S.manifest;
+    el("#btnStop").hidden = !b;
+    el("#btnScan").innerHTML = S.running === "scan" ? '<span class="spin"></span> Đang quét…' : "Quét A";
+  }
+  el("#btnStop").onclick = function () { S.stop = true; log("Đã gửi lệnh dừng — sẽ dừng sau mục đang xử lý…", "error"); toast("Đang dừng…"); };
+  el("#btnDry").onclick = function () { run(true); };
+  el("#btnRun").onclick = function () { run(false); };
+  function renderProgress() {
+    var p = S.prog, pct = p.total ? Math.round(100 * p.done / p.total) : 0;
+    el("#progBox").innerHTML = S.running && S.running !== "scan" ? '<div class="dim" style="margin-top:6px"><span class="spin"></span>&nbsp; ' + esc(STAGE_VI[p.stage] || "Đang chạy") + "… " +
+      (p.total ? '<span class="mono">' + p.done + " / " + p.total + " · " + pct + "%</span>" : "") + '</div><div class="prog"><i style="width:' + (p.stage === "clone" ? pct : 100) + '%"></i></div>' : "";
+  }
+  async function run(dry) {
+    var s = S.plan ? S.plan.stats : null;
+    if (!dry && S.mode === "real") {
+      var msg = "Sẽ TẠO THẬT trên Google Drive của bạn:\n\n" + (s ? "• " + s.folders + " thư mục, " + s.copy + " file copy đầy đủ, " + s.skeleton + " file vỏ rỗng\n• Đổi tên " + s.renamed + " mục\n" : "") +
+        "• Đích: " + (S.form.dest || "My Drive — thư mục mới") + "\n\nThư mục A không bị sửa gì. Tiếp tục?";
+      if (!confirm(msg)) return;
+    }
+    S.running = "run"; S.stop = false; S.logs = []; S.prog = { done: 0, total: 0, stage: "clone" }; S.tab = "console";
+    syncButtons(); renderProgress(); el("#resTabs").hidden = false; el("#resBody").hidden = false; setTab("console");
+    el("#pResult").scrollIntoView({ behavior: "smooth", block: "start" });
+    try {
+      var out = await DC.run(S.backend, S.manifest, options({ dry_run: dry }), {
+        log: log, shouldStop: function () { return S.stop; },
+        progress: function (d, t) { S.prog.done = d; if (t != null) S.prog.total = t; renderProgress(); },
+        stage: function (st) { S.prog.stage = st; renderProgress(); },
+      });
+      S.detail = { out: out, logs: S.logs.slice(), mode: S.mode };
+      saveHistory(out);
+      S.tab = "log";
+      toast(out.result.stopped ? "Đã dừng giữa chừng." : dry ? "Chạy thử xong — xem Change Log dự kiến." : out.ok ? "Clone xong, hậu kiểm đạt." : "Clone xong nhưng có mục không đạt — xem Hậu kiểm.", out.ok || dry ? "ok" : "bad");
+    } catch (e) {
+      log("LỖI: " + e.message, "error"); toast(e.message, "bad");
+    }
+    S.running = null; syncButtons(); renderProgress(); renderResult(); renderHistory();
+  }
+
+  // ------------------------------------------------------------------ kết quả
+  function renderResult() {
+    var d = S.detail;
+    if (!d) { if (S.logs.length) { el("#resTabs").hidden = false; el("#resBody").hidden = false; setTab("console"); } return; }
+    var o = d.out, r = o.result, c = o.counts, rep = o.report, rs = rep.summary, plan = o.plan, dry = r.dry_run;
+    el("#resWhen").textContent = o.finished_at.replace("T", " ") + (dry ? " · chạy thử" : "") + (d.mode === "demo" ? " · DEMO" : "");
+    var links = [];
+    if (!dry && r.root_url && d.mode === "real") links.push('<a class="btn sm" href="' + esc(r.root_url) + '" target="_blank" rel="noopener">Mở bản sao</a>');
+    if (o.log_sheet && d.mode === "real") links.push('<a class="btn sm" href="' + esc(o.log_sheet.url) + '" target="_blank" rel="noopener">Change Log trên Drive</a>');
+    links.push('<button class="btn sm" id="dlCsv">Tải Change Log .csv</button>');
+    el("#resLinks").innerHTML = links.join("");
+    el("#dlCsv").onclick = function () { download("ChangeLog_" + o.started_at.replace(/[-:T]/g, "").slice(0, 12) + ".csv", "\uFEFF" + DC.toCsv(r.entries)); };
+    var verdict = dry ? '<div class="verdict mid">👁 CHẠY THỬ — chưa tạo gì trên Drive. Đây là Change Log dự kiến.</div>'
+      : r.stopped ? '<div class="verdict mid">⚠ ĐÃ DỪNG GIỮA CHỪNG — bấm Clone thật lần nữa để chạy tiếp (mục đã có sẽ được bỏ qua).</div>'
+      : o.ok ? '<div class="verdict ok">✓ HOÀN TẤT — hậu kiểm đạt<span class="sm">PASS ' + (rs.PASS || 0) + " · WARN " + (rs.WARN || 0) + " · SKIP " + (rs.SKIP || 0) + "</span></div>"
+      : '<div class="verdict bad">⚠ XONG NHƯNG CÓ MỤC KHÔNG ĐẠT — xem tab Hậu kiểm<span class="sm">FAIL ' + (rs.FAIL || 0) + " · lỗi " + c.errors + "</span></div>";
+    var tile = function (n, l, cls) { return '<div class="stat ' + (cls || "") + '"><b>' + n + "</b><span>" + l + "</span></div>"; };
+    el("#resTop").innerHTML = verdict + '<div class="stats">' + tile(c.folders_created, "thư mục tạo mới", "acc") + (c.folders_merged ? tile(c.folders_merged, "thư mục gộp") : "") +
+      tile(c.files_copied, "file copy đầy đủ", "acc") + (c.skeletons ? tile(c.skeletons, "file vỏ rỗng", "acc") : "") + (c.exists ? tile(c.exists, "đã có — giữ nguyên", "warn") : "") +
+      tile(c.renamed, "mục đổi tên", "acc") + (r.remap && r.remap.links_changed ? tile(r.remap.links_changed, "link đã đổi") : "") + tile(c.errors, "lỗi", c.errors ? "bad" : "") + "</div>" +
+      '<p class="hint">A: <b>' + esc(plan.source.name) + "</b> → B: <b>" + esc(r.dest_name) + "</b>" + (r.root_name && r.root_name !== r.dest_name ? " / <b>" + esc(r.root_name) + "</b>" : "") +
+      " · " + (plan.options.content_mode === "full" ? "copy toàn bộ" : "dựng khung") + " · " +
+      (plan.options.rename_rules.map(function (x) { return '<span class="mono">' + esc(x.from) + "→" + esc(x.to) + "</span>"; }).join(", ") || "không đổi tên") + "</p>";
+    el("#resTabs").hidden = false; el("#resBody").hidden = false;
+    el("#nLog").textContent = r.entries.length;
+    el("#nVerify").textContent = rep.checks[0].id === "C0" ? "—" : rs.FAIL ? rs.FAIL + " FAIL" : "PASS";
+    setTab(S.tab);
+  }
+  el("#resTabs").onclick = function (e) { var b = e.target.closest("button"); if (b) setTab(b.dataset.t); };
+  function setTab(t) { S.tab = t; $$("#resTabs button").forEach(function (b) { b.classList.toggle("on", b.dataset.t === t); }); renderBody(); }
+  function renderBody() {
+    var body = el("#resBody"), d = S.detail;
+    if (S.tab === "console") {
+      var logs = S.running || !d ? S.logs : d.logs;
+      body.innerHTML = '<div class="logbox" id="logbox">' + (logs.map(function (l) { return '<div class="' + (l.level === "error" ? "e" : "") + '"><span class="faint">' + esc(l.t) + "</span>  " + esc(l.msg) + "</div>"; }).join("") || "Chưa có nhật ký.") + "</div>";
+      var lb = el("#logbox"); lb.scrollTop = lb.scrollHeight; return;
+    }
+    if (!d) { body.innerHTML = '<div class="empty">Chưa có kết quả.</div>'; return; }
+    if (S.tab === "verify") return renderVerify(body, d.out.report);
+    renderLog(body, d.out.result.entries);
+  }
+  function renderLog(body, entries) {
+    var f = S.logFilter, q = S.logQ.trim().toLowerCase();
+    var by = { all: function () { return true; }, renamed: function (e) { return e.renamed === "YES"; }, error: function (e) { return e.status === "ERROR"; },
+      exists: function (e) { return e.status === "EXISTS" || e.status === "SKIPPED"; }, folder: function (e) { return e.type === "Folder"; } };
+    var list = entries.filter(function (e) { return by[f](e) && (!q || (e.old_name + " " + e.new_name + " " + e.new_path).toLowerCase().indexOf(q) >= 0); });
+    var n = function (k) { return entries.filter(by[k]).length; };
+    var chip = function (k, l) { return '<button class="chip ' + (f === k ? "on" : "") + '" data-lf="' + k + '">' + l + '<span class="n">' + n(k) + "</span></button>"; };
+    var shown = list.slice(0, 1500);
+    body.innerHTML = '<div class="toolbar"><div id="logChips">' + chip("all", "Tất cả") + " " + chip("renamed", "Đổi tên") + " " + chip("error", "Lỗi") + " " + chip("exists", "Đã có / bỏ qua") + " " + chip("folder", "Thư mục") +
+      '</div><span class="grow"></span><input type="search" id="logQ" placeholder="Tìm tên / đường dẫn…" value="' + esc(S.logQ) + '"></div>' +
+      '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Trạng thái</th><th>Loại</th><th>Tên cũ → tên mới</th><th>Đường dẫn mới</th><th>Ghi chú</th><th></th></tr></thead><tbody>' +
+      shown.map(function (e) {
+        return '<tr><td class="nw"><span class="st ' + e.status + '" title="' + esc(STATUS_VI[e.status] || "") + '">' + e.status + '</span></td><td class="nw dim">' + esc(e.type) + "</td><td>" +
+          (e.renamed ? '<span class="old">' + esc(e.old_name) + '</span> <span class="faint">→</span> <span class="ren">' + esc(e.new_name) + "</span>" : esc(e.new_name)) +
+          '</td><td class="pth">' + esc(e.new_path) + '</td><td class="dim" style="font-size:12.5px">' + esc(e.note) + '</td><td class="nw">' +
+          (e.old_link ? '<a href="' + esc(e.old_link) + '" target="_blank" rel="noopener" class="faint" title="Mở bản gốc (A)">A</a>' : "") +
+          (e.new_link ? ' · <a href="' + esc(e.new_link) + '" target="_blank" rel="noopener" title="Mở bản sao (B)">B</a>' : "") + "</td></tr>";
+      }).join("") + "</tbody></table>" + (shown.length ? "" : '<div class="empty">Không có dòng nào.</div>') + "</div>" +
+      (list.length > shown.length ? '<p class="hint">Đang hiện ' + shown.length + "/" + list.length + " dòng — tải CSV để xem đủ.</p>" : "");
+    el("#logChips").onclick = function (ev) { var b = ev.target.closest("[data-lf]"); if (b) { S.logFilter = b.dataset.lf; renderBody(); } };
+    var inp = el("#logQ");
+    inp.oninput = function () { S.logQ = inp.value; var pos = inp.selectionStart; renderBody(); var ni = el("#logQ"); ni.focus(); ni.setSelectionRange(pos, pos); };
+  }
+  function renderVerify(body, rep) {
+    body.innerHTML = '<div class="tbl-wrap" style="max-height:none"><table class="tbl"><thead><tr><th>#</th><th>Hạng mục</th><th>KQ</th><th>Chi tiết</th></tr></thead><tbody>' +
+      rep.checks.map(function (c) {
+        return '<tr><td class="nw mono">' + esc(c.id) + "</td><td>" + esc(c.name) + '</td><td><span class="st ' + c.status + '">' + c.status + "</span></td><td>" + esc(c.detail) +
+          (c.rows && c.rows.length ? '<details class="rows"><summary>' + c.rows.length + ' dòng chi tiết</summary><div class="box">' +
+            esc(c.rows.map(function (r) { return Object.keys(r).map(function (k) { return k + ": " + r[k]; }).join("  |  "); }).join("\n")) + "</div></details>" : "") + "</td></tr>";
+      }).join("") + "</tbody></table></div>" +
+      '<p class="hint">Hậu kiểm <b>quét lại thư mục đích từ đầu</b> rồi đối chiếu kế hoạch — không tin dữ liệu tool vừa ghi. C9 soát tên thật ở đích xem còn sót chuỗi cũ không.</p>';
+  }
+
+  // ------------------------------------------------------------------ lịch sử (trình duyệt này)
+  function saveHistory(o) {
+    if (S.mode === "demo") return;
+    S.history.unshift({ at: o.finished_at, dry: o.result.dry_run, stopped: o.result.stopped, ok: o.ok, source: o.plan.source.name, dest: o.result.dest_name,
+      root: o.result.root_name, root_url: o.result.root_url, log_url: o.log_sheet ? o.log_sheet.url : "", counts: o.counts });
+    S.history = S.history.slice(0, 30);
+    store.set("dc.history", S.history);
+  }
+  function renderHistory() {
+    el("#hist").innerHTML = S.history.length ? S.history.map(function (h) {
+      var tag = h.dry ? '<span class="badge warn">chạy thử</span>' : h.stopped ? '<span class="badge warn">dừng</span>' : h.ok ? '<span class="badge ok">PASS</span>' : '<span class="badge" style="color:var(--bad)">FAIL</span>';
+      return '<div class="hist-row"><span class="mono dim">' + esc(h.at.replace("T", " ").slice(5, 16)) + "</span>" + tag + "<span><b>" + esc(h.source) + '</b> <span class="faint">→</span> ' + esc(h.dest) +
+        (h.root && h.root !== h.dest ? " / " + esc(h.root) : "") + '<span class="dim"> · ' + h.counts.total + " mục · đổi tên " + h.counts.renamed + (h.counts.errors ? " · lỗi " + h.counts.errors : "") + "</span></span>" +
+        '<span class="grow"></span>' + (h.root_url && !h.dry ? '<a href="' + esc(h.root_url) + '" target="_blank" rel="noopener">bản sao</a>' : "") + (h.log_url ? ' · <a href="' + esc(h.log_url) + '" target="_blank" rel="noopener">Change Log</a>' : "") + "</div>";
+    }).join("") : '<div class="empty">Chưa có lần chạy thật nào trên trình duyệt này.</div>';
+  }
+  function renderAll() { renderScanInfo(); renderPlan(); renderResult(); renderHistory(); syncButtons(); renderPath(); }
+
+  // ------------------------------------------------------------------ khởi động
+  if (HAS_GAS) {
+    S.backend = GasBackend; S.mode = "real"; S.form = Object.assign(defaults(), store.get(formKey(), {}));
+    bindForm(); renderAll(); renderWho();
+    GasBackend.whoami().then(function (u) {
+      S.account = u; renderWho();
+      if (u.missing && u.missing.length) {
+        S.backend = null; syncButtons();
+        $("#who").innerHTML = '<span class="badge" style="color:var(--bad)">⚠ Chưa có quyền Drive</span>';
+        var box = document.createElement("div");
+        box.className = "note bad"; box.style.marginTop = "14px";
+        var fake = u.fake_manifest ? "Project có file <b>appsscript.json.html</b> tạo tay (không còn cần) — xoá được (⋮ → Delete).<br><br>" : "";
+        box.innerHTML = "<div>" + fake + "<b>Web app chưa được cấp quyền Google Drive</b> — tài khoản này mới cho phép: " + esc((u.scopes || []).join(", ") || "(không có)") +
+          ".<br>Quản trị viên sửa 1 lần: dán <b>Code.gs</b> + <b>Index.html</b> mới từ Tool Kit → trong trình soạn thảo chọn hàm <b>kiemTraQuyen</b> (ô cạnh nút ▷ Run) → <b>Run</b> → <b>Allow</b> → " +
+          "xem Execution log. Báo ĐỦ → <b>Deploy → Manage deployments → Edit (bút chì) → Version: New version → Deploy</b>, rồi tải lại trang này. " +
+          "Báo THIẾU → log chỉ cách xoá khối <b>oauthScopes</b> trong appsscript.json.</div>";
+        document.getElementById("app").prepend(box);
+      }
+    })
+      .catch(function (e) { $("#who").innerHTML = '<span class="badge" style="color:var(--bad)">⚠ ' + esc(e.message) + "</span>"; });
+  } else {
+    setMode("demo");
+    toast("Đang mở ngoài Apps Script — chỉ có chế độ Demo.");
+  }
+})();
+</script>
